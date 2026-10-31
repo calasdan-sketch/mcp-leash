@@ -86,7 +86,7 @@ class TestWindowsClosedPipe(unittest.TestCase):
                 mock.patch.object(cli_mod, "_broken_pipe", lambda: (gone.append(1), 0)[1]), \
                 mock.patch.object(sys, "stdout", _DeadPipe(exc)):
             with mock.patch.object(cli_mod, "_main", lambda argv: print("hello") or 0):
-                rc = cli_mod.main([])
+                cli_mod.main([])
 
 
 if __name__ == "__main__":

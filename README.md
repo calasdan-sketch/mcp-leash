@@ -531,6 +531,21 @@ The jail is a transparent JSON-RPC relay apart from the policy check:
 What mcp-jail does not do, in plain words (the two caveats on deny
 patterns and on `learn` above apply as well):
 
+- **It is a policy filter, not a sandbox.** mcp-jail inspects JSON-RPC
+  messages on the pipe. It does not confine the server *process*: the
+  server you wrap still runs with your full user rights and can read
+  files, open network connections and start programs on its own, on
+  Windows, Linux and macOS alike. A denied `tools/call` never reaches the
+  server; nothing stops a malicious server from doing harm outside the
+  protocol. For that, run the server in a container, VM or separate
+  low-privilege account and use mcp-jail on top.
+- **What differs by platform.** Policy checking, the audit log, exit
+  codes and `--grace` behave the same everywhere. File mode `0600` on the
+  audit log and policy is enforced on POSIX and best effort on Windows
+  (the per-user profile is the fence). SIGTERM/SIGHUP handling is POSIX;
+  Windows has Ctrl-Break only, and `terminate()` ends the server outright.
+  No platform gets process isolation, a file-system allowlist or a
+  network filter from mcp-jail.
 - **A URI in `allow_tools` is compared like a tool name**: NFKC-normalised
   and case-folded. A policy that allows `file:///srv/Public` also allows
   `file:///srv/public`, which on a case-sensitive file system is a
