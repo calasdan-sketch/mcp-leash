@@ -7,8 +7,8 @@ JSON-RPC error and an audit-log line instead of execution.
 Zero client changes: swap the server command for the jail wrapper.
 
   "my-server": {
-    "command": "mcp-jail",
-    "args": ["--policy", "~/.mcp-jail/policy.json", "--",
+    "command": "mcp-leash",
+    "args": ["--policy", "~/.mcp-leash/policy.json", "--",
              "npx", "-y", "some-mcp-server"]
   }
 
@@ -110,7 +110,7 @@ def _missing_streams(client_in, client_out) -> "str | None":
             if stream is None]
     if len(shut) == 2:
         return ("standard input and output are closed (the client talks to "
-                "mcp-jail over them)")
+                "mcp-leash over them)")
     if shut == ["input"]:
         return "standard input is closed (the client's messages arrive on it)"
     if shut == ["output"]:
@@ -140,9 +140,16 @@ def _say(line: str) -> None:
 
 
 def jail_dir() -> str:
-    """~/.mcp-jail, resolved at call time (so HOME/USERPROFILE overrides
-    in tests and launchers are honoured)."""
-    return os.path.join(os.path.expanduser("~"), ".mcp-jail")
+    """~/.mcp-leash, resolved at call time (so HOME/USERPROFILE overrides
+    in tests and launchers are honoured). Before the rename to mcp-leash
+    the directory was ~/.mcp-jail: it is still used when it exists and
+    ~/.mcp-leash does not, so existing policies and audit logs keep working."""
+    home = os.path.expanduser("~")
+    new = os.path.join(home, ".mcp-leash")
+    old = os.path.join(home, ".mcp-jail")
+    if not os.path.isdir(new) and os.path.isdir(old):
+        return old
+    return new
 
 
 def default_policy_path() -> str:
@@ -152,7 +159,7 @@ def default_policy_path() -> str:
 def expand_path(path: str) -> str:
     """~ and environment variables, as a shell would have done it. MCP
     clients pass our arguments straight from a JSON config file - there
-    is no shell in between to expand `~/.mcp-jail/policy.json`."""
+    is no shell in between to expand `~/.mcp-leash/policy.json`."""
     # normpath: expanduser keeps the forward slash of "~/x" on Windows
     return os.path.normpath(os.path.expandvars(os.path.expanduser(path)))
 
@@ -197,7 +204,7 @@ _TRAVERSAL = re.compile(r"(?:^|[/\\])\.\.(?:[/\\]|$)")
 # C:\proj\../.ssh/id_rsa, hence both separators. The matcher refuses `..`
 # segments too; the guard keeps the policy file honest on its own.
 _TRAVERSAL_GUARD = r"(?!.*(?:^|[/\\])\.\.(?:[/\\]|$))"
-# What mcp-jail < 0.5 emitted (forward slash only). Still recognised as a
+# What mcp-leash < 0.5 emitted (forward slash only). Still recognised as a
 # guard, so a policy learned back then does not count as opting in to `..`.
 _OLD_TRAVERSAL_GUARD = r"(?!.*(?:^|/)\.\.(?:/|$))"
 
@@ -604,13 +611,13 @@ def load_policy(path: str) -> dict:
     if isinstance(pol, dict):
         for key in _INTERNAL_KEYS:
             if key in pol:
-                raise ValueError(f"{key!r} is reserved for mcp-jail's own use")
+                raise ValueError(f"{key!r} is reserved for mcp-leash's own use")
     return compile_policy(pol)
 
 
 def default_policy() -> dict:
     return {
-        "_comment": "mcp-jail policy. Unknown keys are refused at startup. "
+        "_comment": "mcp-leash policy. Unknown keys are refused at startup. "
                     "allow_tools/deny_tools are tool names "
                     "('*' = all; deny wins; names are compared normalised: "
                     "NFKC, case-folded, trimmed, invisible characters "
@@ -890,7 +897,7 @@ def _open_private_append(path: str):
     existed = os.path.exists(path)
     fd = os.open(path, flags, 0o600)
     if existed and os.name != "nt":
-        try:  # a log created by an older mcp-jail was 0644: tighten it
+        try:  # a log created by an older mcp-leash was 0644: tighten it
             if stat.S_IMODE(os.stat(path).st_mode) & 0o077:
                 os.chmod(path, 0o600)
         except OSError:
@@ -909,7 +916,7 @@ def audit(event: dict) -> None:
         with _open_private_append(path) as f:
             f.write(json.dumps(event) + "\n")
     except OSError as e:
-        _say(f"mcp-jail: cannot write audit log {path}: {e}")
+        _say(f"mcp-leash: cannot write audit log {path}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1051,7 +1058,7 @@ def _binary_in(stream):
         return buf
     if isinstance(stream, (io.RawIOBase, io.BufferedIOBase)):
         return stream
-    raise TypeError("mcp-jail needs a binary stream for stdin")
+    raise TypeError("mcp-leash needs a binary stream for stdin")
 
 
 class _Writer:
@@ -1062,7 +1069,7 @@ class _Writer:
         self._binary = getattr(stream, "buffer", None)
         if self._binary is None:
             if not isinstance(stream, (io.RawIOBase, io.BufferedIOBase)):
-                raise TypeError("mcp-jail needs a binary stream for stdout")
+                raise TypeError("mcp-leash needs a binary stream for stdout")
             self._binary = stream
 
     def write(self, data: bytes) -> None:
@@ -1125,7 +1132,7 @@ class _ServerInput:
                     os.close(self._fd)
                     raise
         self._thread = threading.Thread(target=self._run, daemon=True,
-                                        name="mcp-jail-server-writer")
+                                        name="mcp-leash-server-writer")
 
     def start(self) -> None:
         self._thread.start()
@@ -1224,7 +1231,7 @@ class _Reader(threading.Thread):
     (tag, None) marks EOF or a broken pipe."""
 
     def __init__(self, stream, tag: str, q: "queue.Queue"):
-        super().__init__(name=f"mcp-jail-{tag}-reader", daemon=True)
+        super().__init__(name=f"mcp-leash-{tag}-reader", daemon=True)
         self._stream, self._tag, self._q = stream, tag, q
 
     def run(self) -> None:
@@ -1659,7 +1666,7 @@ class _Proxy:
     # -- helpers ----------------------------------------------------------
 
     def _log(self, msg: str) -> None:
-        _say(f"mcp-jail: {msg}")
+        _say(f"mcp-leash: {msg}")
 
     def _deadline(self) -> float | None:
         return (time.monotonic() + self.timeout) if self.timeout else None
@@ -1788,7 +1795,7 @@ class _Proxy:
             audit({"method": method, "decision": "deny", "reason": reason})
             if has_id:
                 self.client.send(_rpc_error(req_id, METHOD_NOT_FOUND,
-                                            f"mcp-jail denied: {reason}"))
+                                            f"mcp-leash denied: {reason}"))
             return
         if (mkey == "tools/call" if self.pol is None
                 else method_policed(self.pol, method)):
@@ -1815,7 +1822,7 @@ class _Proxy:
                 # (no id) never gets a response — it is just dropped.
                 if has_id:
                     self.client.send(_rpc_error(req_id, INVALID_PARAMS,
-                                                f"mcp-jail denied: {reason}"))
+                                                f"mcp-leash denied: {reason}"))
                 return
             if self.observer is not None and has_id and mkey == "tools/call":
                 call = (name, targs)  # recorded once the server succeeds
@@ -2171,34 +2178,34 @@ def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
     """
     problem = _refuse_seconds(timeout=timeout, grace=grace)
     if problem:
-        _say(f"mcp-jail: {problem}")
+        _say(f"mcp-leash: {problem}")
         return 2
     policy_path = expand_path(policy_path)
     try:
         pol = load_policy(policy_path)
     except FileNotFoundError:
-        _say(f"mcp-jail: no policy at {policy_path}\n"
-             f"mcp-jail: create one - see README")
+        _say(f"mcp-leash: no policy at {policy_path}\n"
+             f"mcp-leash: create one - see README")
         return 2
     except OSError as e:        # a directory, no permission, ...
-        _say(f"mcp-jail: cannot read the policy {policy_path}: {e}")
+        _say(f"mcp-leash: cannot read the policy {policy_path}: {e}")
         return 2
     except RecursionError:
-        _say("mcp-jail: bad policy: nested too deeply")
+        _say("mcp-leash: bad policy: nested too deeply")
         return 2
     except (json.JSONDecodeError, re.error, ValueError) as e:
-        _say(f"mcp-jail: bad policy: {e}")
+        _say(f"mcp-leash: bad policy: {e}")
         return 2
     client_in, client_out = stdin or sys.stdin, stdout or sys.stdout
     closed = _missing_streams(client_in, client_out)
     if closed:
-        _say(f"mcp-jail: {closed}")
+        _say(f"mcp-leash: {closed}")
         return 2
     with _StopSignals() as stop:
         try:
             proc = _spawn(server_cmd)
         except ServerNotFound as e:
-            _say(f"mcp-jail: {_server_problem(e)}")
+            _say(f"mcp-leash: {_server_problem(e)}")
             return 2
         try:
             return _Proxy(proc, client_in, client_out, timeout, pol,
@@ -2253,7 +2260,7 @@ def _value_pattern(values: list) -> str:
 
     Anchored \\A...\\Z (not ^...$: `$` would also admit a value with a
     trailing newline), so the regex pins the whole value for any
-    consumer of the policy file, not only mcp-jail's matcher.
+    consumer of the policy file, not only mcp-leash's matcher.
     """
     tag = _type_tag(values[0])
     if tag == "null":
@@ -2346,7 +2353,7 @@ def generate_policy(observed_tools: list[str],
     for (tool, gen_path), values in sorted(by_path.items()):
         arg_rules[tool]["allow"][gen_path] = _value_rules(values)
     policy: dict = {
-        "_comment": "generated by `mcp-jail learn` - tightest-fit "
+        "_comment": "generated by `mcp-leash learn` - tightest-fit "
                     "allowlist from observed traffic. Review before use: "
                     "it permits exactly what was seen, nothing more. "
                     "Only tools that were called are allowed; every "
@@ -2471,7 +2478,7 @@ class _Session:
             if "method" in obj:
                 if obj.get("id") is not None:
                     self.notify(_rpc_error(obj["id"], METHOD_NOT_FOUND,
-                                           "mcp-jail learn: client requests "
+                                           "mcp-leash learn: client requests "
                                            "are not supported"))
                 continue
             if "id" in obj and _id_key(obj["id"]) == want:
@@ -2519,7 +2526,7 @@ def _drive_script(session: _Session, calls: list[dict], timeout: float,
     status = session.request(
         {"jsonrpc": "2.0", "id": "learn-init", "method": "initialize",
          "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {},
-                    "clientInfo": {"name": "mcp-jail", "version": VERSION}}},
+                    "clientInfo": {"name": "mcp-leash", "version": VERSION}}},
         timeout)
     if status[0] != "ok":
         return (f"server did not answer initialize ({status[0]})"
@@ -2590,28 +2597,28 @@ def learn(server_cmd: list[str], script: str | None = None,
     """
     problem = _refuse_seconds(timeout=timeout, grace=grace)
     if problem:
-        _say(f"mcp-jail learn: {problem}")
+        _say(f"mcp-leash learn: {problem}")
         return 2
     calls: list[dict] = []
     if script is not None:
         script = expand_path(script)
         if not os.path.exists(script):
-            _say(f"mcp-jail learn: no script at {script}")
+            _say(f"mcp-leash learn: no script at {script}")
             return 2
         try:
             calls = load_script(script)
         except (OSError, ValueError) as e:
-            _say(f"mcp-jail learn: bad --script {script}: {e}")
+            _say(f"mcp-leash learn: bad --script {script}: {e}")
             return 2
     if out:
         out = expand_path(out)
         if os.path.isdir(out):
-            _say(f"mcp-jail learn: --out {out} is a directory")
+            _say(f"mcp-leash learn: --out {out} is a directory")
             return 2
         try:
             os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
         except OSError as e:
-            _say(f"mcp-jail learn: cannot create the directory for "
+            _say(f"mcp-leash learn: cannot create the directory for "
                  f"--out {out}: {e}")
             return 2
     client_in, client_out = stdin or sys.stdin, stdout or sys.stdout
@@ -2623,7 +2630,7 @@ def learn(server_cmd: list[str], script: str | None = None,
     else:
         closed = None
     if closed:
-        _say(f"mcp-jail learn: {closed}")
+        _say(f"mcp-leash learn: {closed}")
         return 2
     rec = _Recorder()
     # a live session ends on SIGTERM / SIGHUP as it does on Ctrl-C, with the
@@ -2632,7 +2639,7 @@ def learn(server_cmd: list[str], script: str | None = None,
         try:
             proc = _spawn(server_cmd)
         except ServerNotFound as e:
-            _say(f"mcp-jail learn: {_server_problem(e)}")
+            _say(f"mcp-leash learn: {_server_problem(e)}")
             return 2
         failure: str | None = None
         try:

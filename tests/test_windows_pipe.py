@@ -11,7 +11,7 @@ import sys
 import unittest
 from unittest import mock
 
-from mcp_jail import cli as cli_mod
+from mcp_leash import cli as cli_mod
 
 
 class _DeadPipe(io.StringIO):

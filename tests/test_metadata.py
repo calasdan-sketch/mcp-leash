@@ -2,7 +2,7 @@ import pathlib
 import re
 import unittest
 
-import mcp_jail
+import mcp_leash
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -13,7 +13,7 @@ class MetadataTests(unittest.TestCase):
         if not pp.exists():
             self.skipTest("pyproject.toml not present")
         m = re.search(r'^version\s*=\s*"([^"]+)"', pp.read_text(encoding="utf-8"), re.M)
-        self.assertEqual(m.group(1), mcp_jail.VERSION)
+        self.assertEqual(m.group(1), mcp_leash.VERSION)
 
     def test_readme_says_not_a_sandbox(self):
         rd = ROOT / "README.md"

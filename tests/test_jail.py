@@ -1,9 +1,9 @@
-"""mcp-jail tests: fake upstream server over stdio, no network.
+"""mcp-leash tests: fake upstream server over stdio, no network.
 
 Portable by construction: no symlinks, no select(), no signals; every
 text file is opened with an explicit encoding; HOME/USERPROFILE/APPDATA
 point at a throwaway directory for the whole module so nothing here ever
-reads or writes the real user's ~/.mcp-jail.
+reads or writes the real user's ~/.mcp-leash.
 """
 
 import argparse
@@ -24,8 +24,8 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from mcp_jail import cli as cli_mod
-from mcp_jail import jail as jail_mod
+from mcp_leash import cli as cli_mod
+from mcp_leash import jail as jail_mod
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -83,7 +83,7 @@ def mktemp() -> str:
 
 
 def child_env() -> dict:
-    """Environment for a real subprocess running mcp-jail. This sandbox sets
+    """Environment for a real subprocess running mcp-leash. This sandbox sets
     PYTHONUNBUFFERED, which hides a child that forgot to flush: drop it."""
     env = dict(os.environ)
     env.pop("PYTHONUNBUFFERED", None)
@@ -868,7 +868,7 @@ class TestIdMatching(ProxyCase):
 
 class TestTransport(ProxyCase):
     def test_no_select_or_posix_only_calls_in_package(self):
-        pkg = os.path.join(REPO, "mcp_jail")
+        pkg = os.path.join(REPO, "mcp_leash")
         for name in os.listdir(pkg):
             if not name.endswith(".py"):
                 continue
@@ -887,7 +887,7 @@ class TestTransport(ProxyCase):
                                       "arg_rules": {}, "hide_denied": True})
         env = child_env()
         proc = subprocess.Popen(
-            [sys.executable, "-m", "mcp_jail", "--policy", pol, "--timeout", "10",
+            [sys.executable, "-m", "mcp_leash", "--policy", pol, "--timeout", "10",
              "--", sys.executable, srv],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=env, cwd=self.tmp)
@@ -1055,7 +1055,7 @@ class TestCLI(unittest.TestCase):
                          jail_mod.default_policy_path())
         jail_mod.audit({"tool": "t", "decision": "allow", "reason": ""})
         self.assertTrue(os.path.isfile(
-            os.path.join(_fake_home, ".mcp-jail", "audit.jsonl")))
+            os.path.join(_fake_home, ".mcp-leash", "audit.jsonl")))
 
     def test_audit_output_survives_cp1252_console(self):
         jail_mod.audit({"tool": "café_日本", "decision": "deny",
@@ -1079,8 +1079,11 @@ class TestCLI(unittest.TestCase):
         with open(os.path.join(REPO, "pyproject.toml"), "rb") as f:
             data = tomllib.load(f)
         self.assertEqual(data["project"]["version"], cli_mod.VERSION)
+        self.assertEqual(data["project"]["scripts"]["mcp-leash"],
+                         "mcp_leash.cli:main")
+        # the old command stays as an alias
         self.assertEqual(data["project"]["scripts"]["mcp-jail"],
-                         "mcp_jail.cli:main")
+                         "mcp_leash.cli:main")
         buf = io.StringIO()
         with redirect_stdout(buf):
             with self.assertRaises(SystemExit) as cm:
@@ -1090,11 +1093,11 @@ class TestCLI(unittest.TestCase):
 
     def test_the_version_is_written_alike_in_both_places_and_was_raised(self):
         # unlike the test above, on Python 3.10 too (no tomllib). Round 7
-        # changed what mcp-jail does (exit codes, messages, what learn
+        # changed what mcp-leash does (exit codes, messages, what learn
         # writes), so the version is above the 0.6.1 it started from.
         with open(os.path.join(REPO, "pyproject.toml"), encoding="utf-8") as f:
             [in_pyproject] = re.findall(r'(?m)^version = "([^"]+)"$', f.read())
-        with open(os.path.join(REPO, "mcp_jail", "__init__.py"),
+        with open(os.path.join(REPO, "mcp_leash", "__init__.py"),
                   encoding="utf-8") as f:
             [in_package] = re.findall(r'(?m)^VERSION = "([^"]+)"$', f.read())
         self.assertEqual(in_pyproject, in_package)
@@ -1385,7 +1388,7 @@ class TestLearnAllowlist(ProxyCase):
 
 
 class TestLearnedPolicyLoads(ProxyCase):
-    """R7 mcp-jail #3: `learn` wrote a policy its own loader refuses when a
+    """R7 mcp-leash #3: `learn` wrote a policy its own loader refuses when a
     called tool had a `*` in its name ("search*": `*` is not a tool name in
     arg_rules, and a tool called "*" was written as allow_tools ["*"], every
     tool) or when two called names were one name once normalised (Read and
@@ -1536,16 +1539,16 @@ class TestLearnedPolicyLoads(ProxyCase):
 
 class TestPolicyPath(unittest.TestCase):
     """J-2: ~ and environment variables in --policy / --path / --out are
-    expanded by mcp-jail itself: MCP clients pass arguments from a JSON
+    expanded by mcp-leash itself: MCP clients pass arguments from a JSON
     config, no shell in between."""
 
     def test_tilde_and_env_vars_expand(self):
-        d = os.path.join(_fake_home, ".mcp-jail")
+        d = os.path.join(_fake_home, ".mcp-leash")
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "policy.json"), "w", encoding="utf-8") as f:
             json.dump(ALLOW_ALL, f)
-        for spec in ("~/.mcp-jail/policy.json",
-                     os.path.join("${HOME}", ".mcp-jail", "policy.json")):
+        for spec in ("~/.mcp-leash/policy.json",
+                     os.path.join("${HOME}", ".mcp-leash", "policy.json")):
             err = io.StringIO()
             with redirect_stderr(err):
                 code = jail_mod.run(spec, [sys.executable, "-c", "pass"],
@@ -1554,19 +1557,19 @@ class TestPolicyPath(unittest.TestCase):
         # a genuinely missing policy still says so, with the expanded path
         err = io.StringIO()
         with redirect_stderr(err):
-            code = jail_mod.run("~/.mcp-jail/nope.json", [sys.executable, "-c", "pass"],
+            code = jail_mod.run("~/.mcp-leash/nope.json", [sys.executable, "-c", "pass"],
                                 stdin=io.BytesIO(b""), stdout=io.BytesIO())
         self.assertEqual(code, 2)
-        self.assertIn(os.path.join(_fake_home, ".mcp-jail", "nope.json"),
+        self.assertIn(os.path.join(_fake_home, ".mcp-leash", "nope.json"),
                       err.getvalue())
 
     def test_init_policy_path_expands_too(self):
         with redirect_stdout(io.StringIO()):
             code = cli_mod.main(["--init-policy", "--path",
-                                 "~/.mcp-jail/sub/policy.json"])
+                                 "~/.mcp-leash/sub/policy.json"])
         self.assertEqual(code, 0)
         self.assertTrue(os.path.isfile(
-            os.path.join(_fake_home, ".mcp-jail", "sub", "policy.json")))
+            os.path.join(_fake_home, ".mcp-leash", "sub", "policy.json")))
 
 
 class TestDuplicateKeys(ProxyCase):
@@ -1827,7 +1830,7 @@ class TestServerCommand(ProxyCase):
 
     def test_missing_server_command_is_a_clean_exit_2(self):
         pol = write_policy(self.tmp, ALLOW_ALL)
-        missing = "mcp-jail-no-such-command-xyz"
+        missing = "mcp-leash-no-such-command-xyz"
         self.assertIsNone(shutil.which(missing))
         err = io.StringIO()
         with redirect_stderr(err):
@@ -1860,7 +1863,7 @@ class TestServerCommand(ProxyCase):
 
 
 class TestServerCommandCannotRun(ProxyCase):
-    """R7 mcp-jail #5: a directory, or a file without the execute permission,
+    """R7 mcp-leash #5: a directory, or a file without the execute permission,
     as the server command was reported as "not found ... (not on PATH)"; a
     file that is executable but cannot be run (no #! line: "Exec format
     error") was a traceback. The message says what the lookup found out - it
@@ -1908,7 +1911,7 @@ class TestServerCommandCannotRun(ProxyCase):
                 self.assertNotIn("PATH", err)
 
     def test_a_command_that_is_not_there_says_the_same_thing(self):
-        missing = "mcp-jail-no-such-command-xyz"
+        missing = "mcp-leash-no-such-command-xyz"
         for how in ("run", "learn", "cli"):
             with self.subTest(how=how):
                 code, err = self.refused([missing], how)
@@ -1977,7 +1980,7 @@ class TestShutdown(ProxyCase):
                                 "quit.py")
         env = child_env()
         proc = subprocess.Popen(
-            [sys.executable, "-m", "mcp_jail", "--policy", pol, "--",
+            [sys.executable, "-m", "mcp_leash", "--policy", pol, "--",
              sys.executable, quit_srv],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=env, cwd=self.tmp)
@@ -2174,11 +2177,11 @@ class TestDocs(unittest.TestCase):
         text = parser.format_help()
         for flag in ("--init-policy", "--force", "--audit", "--limit", "--policy"):
             self.assertIn(flag, text)
-        self.assertIn("mcp-jail learn", text)
+        self.assertIn("mcp-leash learn", text)
 
 
 class TestReadmeMatchesTheCli(ProxyCase):
-    """R7 mcp-jail #4 and #6: the README said --audit "shows every field of a
+    """R7 mcp-leash #4 and #6: the README said --audit "shows every field of a
     record" (it shows the decision, the tool and the reason), and left out
     --init-policy's --path and --force."""
 
@@ -2201,7 +2204,7 @@ class TestReadmeMatchesTheCli(ProxyCase):
             self.assertGreaterEqual(len(flags), 4, (argv, flags))
             for flag in sorted(flags):
                 found = re.search(re.escape(flag) + r"(?![\w-])", readme)
-                self.assertTrue(found, f"{flag} (mcp-jail {' '.join(argv)}) "
+                self.assertTrue(found, f"{flag} (mcp-leash {' '.join(argv)}) "
                                        f"is not in the README")
         # the two that were missing, by name
         main_flags = self.options_in_help([])
@@ -2225,8 +2228,8 @@ class TestReadmeMatchesTheCli(ProxyCase):
                 ["--init-policy", "--path", target, "--force"]), 0)
         jail_mod.load_policy(target)              # replaced
         flat = " ".join(self.readme().split())
-        for needle in ("mcp-jail --init-policy --path my.json",
-                       "mcp-jail --init-policy --force",
+        for needle in ("mcp-leash --init-policy --path my.json",
+                       "mcp-leash --init-policy --force",
                        "`--path FILE` writes it there instead",
                        "unless you add `--force`"):
             self.assertTrue(needle in flat, needle)
@@ -2257,7 +2260,7 @@ class TestReadmeMatchesTheCli(ProxyCase):
 
 
 class TestTempDirectories(unittest.TestCase):
-    """R7 mcp-jail, test hygiene: mktemp() made directories that nothing
+    """R7 mcp-leash, test hygiene: mktemp() made directories that nothing
     removed (four tests, in the system temp directory, on every run). Every
     directory the tests make is now inside one that tearDownModule removes."""
 
@@ -2435,7 +2438,7 @@ class TestLearnHandshake(ProxyCase):
         init = seen[0]["params"]
         self.assertEqual(init["protocolVersion"], jail_mod.PROTOCOL_VERSION)
         self.assertEqual(init["capabilities"], {})
-        self.assertEqual(init["clientInfo"]["name"], "mcp-jail")
+        self.assertEqual(init["clientInfo"]["name"], "mcp-leash")
         self.assertEqual(init["clientInfo"]["version"], cli_mod.VERSION)
         self.assertNotIn("id", seen[1])  # a notification, never a request
 
@@ -2686,7 +2689,7 @@ class TestLearnRobustness(ProxyCase):
         self.assertTrue(os.path.isfile(out))
         # --out naming a directory, or living under a file, is refused
         # BEFORE the server is spawned (a missing command is not reached)
-        missing = "mcp-jail-no-such-command-xyz"
+        missing = "mcp-leash-no-such-command-xyz"
         for bad in (self.tmp, os.path.join(script, "policy.json")):
             code, err, _ = self._learn([missing], script=script, out=bad)
             self.assertEqual(code, 2, bad)
@@ -2703,7 +2706,7 @@ class TestLearnRobustness(ProxyCase):
                 raise OSError(28, "No space left on device")
             return real_open(path, *a, **kw)
 
-        with mock.patch("mcp_jail.jail.open", flaky_open, create=True):
+        with mock.patch("mcp_leash.jail.open", flaky_open, create=True):
             code, err, stdout = self._learn([sys.executable, self.server],
                                             script=script, out=out, timeout=10)
         self.assertEqual(code, 2)
@@ -2712,7 +2715,7 @@ class TestLearnRobustness(ProxyCase):
         self.assertEqual(json.loads(stdout)["allow_tools"], ["read_file"])
 
     def test_bad_script_is_refused_before_the_session(self):
-        missing = "mcp-jail-no-such-command-xyz"
+        missing = "mcp-leash-no-such-command-xyz"
         cases = {
             "notjson.json": ("not json", "not valid JSON"),
             "object.json": ('{"tool": "x"}', "must be a JSON array"),
@@ -3000,7 +3003,7 @@ class TestStrictArgsEmptyContainers(unittest.TestCase):
 
 
 class TestBrokenPipe(unittest.TestCase):
-    """R4-10: `mcp-jail --audit | head` must not end in a traceback."""
+    """R4-10: `mcp-leash --audit | head` must not end in a traceback."""
 
     def setUp(self):
         self._old_audit = jail_mod.AUDIT_LOG
@@ -3028,7 +3031,7 @@ class TestBrokenPipe(unittest.TestCase):
             jail_mod.audit({"tool": f"t{i}", "decision": "deny", "reason": "x" * 100})
         env = child_env()
         proc = subprocess.Popen(
-            [sys.executable, "-m", "mcp_jail", "--audit", "--limit", "200"],
+            [sys.executable, "-m", "mcp_leash", "--audit", "--limit", "200"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         proc.stdout.close()  # the reader (`head`) is gone before we write
         try:
@@ -3172,7 +3175,7 @@ class TestPolicyKeys(ProxyCase):
                                  "hide_denied": False})
 
     def test_tool_name_lists_refuse_an_object_or_a_set(self):
-        """R7 mcp-jail #1: allow_tools / deny_tools took a JSON object and
+        """R7 mcp-leash #1: allow_tools / deny_tools took a JSON object and
         kept only its keys, so the rules nested in it were dropped and the
         tool was allowed without them."""
         for key in ("allow_tools", "deny_tools"):
@@ -3427,7 +3430,7 @@ class TestLineSmuggling(ProxyCase):
         srv = self.srv(FAKE_JAVA, "java.py")
         pol = write_policy(self.tmp, DENY_DELETE)
         proc = subprocess.Popen(
-            [sys.executable, "-m", "mcp_jail", "--policy", pol, "--timeout", "3",
+            [sys.executable, "-m", "mcp_leash", "--policy", pol, "--timeout", "3",
              "--", sys.executable, srv, log],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=child_env(), cwd=self.tmp)
@@ -3840,7 +3843,7 @@ class TestSelectors(ProxyCase):
 
     def assertDenied(self, verdict, *words):
         self.assertNotEqual(verdict, "allow")
-        self.assertIn("mcp-jail denied", verdict)
+        self.assertIn("mcp-leash denied", verdict)
         for w in words:
             self.assertIn(w, verdict)
 
@@ -4044,7 +4047,7 @@ class TestWedgedServer(ProxyCase):
         srv = self.srv(FAKE_DEAF, "deaf.py")
         pol = write_policy(self.tmp, ALLOW_ALL)
         proc = subprocess.Popen(
-            [sys.executable, "-m", "mcp_jail", "--policy", pol, "--timeout", "2",
+            [sys.executable, "-m", "mcp_leash", "--policy", pol, "--timeout", "2",
              "--", sys.executable, srv, pidfile],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=child_env(), cwd=self.tmp)
@@ -4227,7 +4230,7 @@ time.sleep(60)          # and never reads again
         script = write_script(self.tmp, [{"tool": "read_file", "arguments": {"blob": BLOB}}] * 2)
         out = os.path.join(self.tmp, "learned.json")
         proc = subprocess.Popen(
-            [sys.executable, "-m", "mcp_jail", "learn", "--script", script,
+            [sys.executable, "-m", "mcp_leash", "learn", "--script", script,
              "--out", out, "--timeout", "2", "--", sys.executable, srv],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=child_env(), cwd=self.tmp)
@@ -4307,14 +4310,14 @@ class TestExitCodes(ProxyCase):
         self.assertEqual([r["error"]["message"] for r in resps],
                          ["server timed out"] * 2)
         self.assertEqual(err.splitlines(), [
-            "mcp-jail: server did not answer 2 requests within 1s"])
+            "mcp-leash: server did not answer 2 requests within 1s"])
 
     def test_one_request_that_timed_out_is_one_request(self):
         code, resps, err = self.run_with_stderr(
             FAKE_HANG, [call(1, "slow", {})], timeout=1)
         self.assertEqual(code, 3)
         self.assertEqual(err.splitlines(), [
-            "mcp-jail: server did not answer 1 request within 1s"])
+            "mcp-leash: server did not answer 1 request within 1s"])
 
     def test_a_request_the_server_answered_late_is_not_a_timeout(self):
         code, resps, err = self.run_with_stderr(
@@ -4351,7 +4354,7 @@ class TestExitCodes(ProxyCase):
         srv = self.srv("import sys\nsys.exit(0)\n", "gone.py")
         pol = write_policy(self.tmp, ALLOW_ALL)
         proc = subprocess.run(
-            [sys.executable, "-m", "mcp_jail", "--policy", pol, "--",
+            [sys.executable, "-m", "mcp_leash", "--policy", pol, "--",
              sys.executable, srv],
             input=json.dumps(call(1, "read_file", {})).encode() + b"\n",
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env(),
@@ -4398,7 +4401,7 @@ class TestLearnLiveServerLoss(ProxyCase):
 
 
 class TestAuditDisplay(ProxyCase):
-    """R5-6: `mcp-jail --audit` printed the reason (and the tool, and the
+    """R5-6: `mcp-leash --audit` printed the reason (and the tool, and the
     method) as it found it: a denied tool whose NAME carried a newline put a
     forged "allow ..." line into the report, an escape sequence went to the
     terminal, and a record that was not an object crashed it. Every field is
@@ -4647,7 +4650,7 @@ class TestGracefulShutdown(ProxyCase):
                      "a Windows handle-inheritance question; POSIX descriptors "
                      "are simply inherited")
     def test_a_helper_that_holds_the_servers_output_open_is_named_as_the_wait(self):
-        # mcp-jail cannot close the pipe under its own reader, so it does wait
+        # mcp-leash cannot close the pipe under its own reader, so it does wait
         # for the helper (see Limitations); it says why instead of blaming a
         # server that has in fact gone
         srv = self.srv(FAKE_LEAVES_A_HELPER, "helper.py")
@@ -4705,7 +4708,7 @@ class TestGracefulShutdown(ProxyCase):
         pol = write_policy(self.tmp, ALLOW_ALL)
         started = time.monotonic()
         proc = subprocess.run(
-            [sys.executable, "-m", "mcp_jail", "--policy", pol, "--grace", "1",
+            [sys.executable, "-m", "mcp_leash", "--policy", pol, "--grace", "1",
              "--"] + cmd,
             input=b"", capture_output=True, env=child_env(), cwd=self.tmp,
             timeout=60)
@@ -4789,7 +4792,7 @@ class TestSecondsOptions(ProxyCase):
             for bad in ("nan", "inf", "-1"):
                 with self.subTest(option=opt, value=bad):
                     proc = subprocess.run(
-                        [sys.executable, "-m", "mcp_jail", "--policy", pol,
+                        [sys.executable, "-m", "mcp_leash", "--policy", pol,
                          opt, bad, "--", sys.executable, "-c",
                          "open(%r, 'w').close()" % started],
                         input=b"", capture_output=True, env=child_env(),
@@ -4905,7 +4908,7 @@ class TestDenyWildcard(ProxyCase):
                     self.assertFalse(jail_mod.tool_visible(pol, tool)[0])
 
     def test_a_deny_list_that_is_an_object_is_refused(self):
-        # its keys used to count; no object is a tool list now (R7 mcp-jail
+        # its keys used to count; no object is a tool list now (R7 mcp-leash
         # #1), and a refused policy runs nothing, so nothing is let through
         with self.assertRaises(ValueError) as cm:
             jail_mod.compile_policy({"allow_tools": ["*"],
@@ -5029,7 +5032,7 @@ class TestDenyWildcard(ProxyCase):
             with self.subTest(policy=raw):
                 pol = write_policy(self.tmp, raw)
                 proc = subprocess.run(
-                    [sys.executable, "-m", "mcp_jail", "--policy", pol, "--",
+                    [sys.executable, "-m", "mcp_leash", "--policy", pol, "--",
                      sys.executable, "-c", "open(%r, 'w').close()" % started],
                     input=b"", capture_output=True, env=child_env(),
                     cwd=self.tmp, timeout=60)
@@ -5531,7 +5534,7 @@ class TestAuditLimit(ProxyCase):
 
     def test_the_same_from_the_command_line(self):
         proc = subprocess.run(
-            [sys.executable, "-m", "mcp_jail", "--audit", "--limit", "0"],
+            [sys.executable, "-m", "mcp_leash", "--audit", "--limit", "0"],
             env=child_env(), capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(proc.stdout, "")
@@ -5568,7 +5571,7 @@ class TestClosedStandardStreams(ProxyCase):
                     code = jail_mod.run(pol, cmd)
                 self.assertEqual(code, 2)
                 self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
-                self.assertTrue(err.getvalue().startswith("mcp-jail: "))
+                self.assertTrue(err.getvalue().startswith("mcp-leash: "))
                 self.assertIn(want, err.getvalue())
                 self.assertFalse(os.path.exists(marker), "the server was started")
 
@@ -5584,7 +5587,7 @@ class TestClosedStandardStreams(ProxyCase):
                     code = jail_mod.learn(cmd)
                 self.assertEqual(code, 2)
                 self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
-                self.assertTrue(err.getvalue().startswith("mcp-jail learn: "))
+                self.assertTrue(err.getvalue().startswith("mcp-leash learn: "))
                 self.assertIn(want, err.getvalue())
                 self.assertFalse(os.path.exists(marker), "the server was started")
 
@@ -5624,7 +5627,7 @@ class TestClosedStandardStreams(ProxyCase):
                 launcher = ("import os, sys\n"
                             f"os.close({fd})\n"
                             "os.execv(sys.executable, [sys.executable, '-m', "
-                            "'mcp_jail'] + sys.argv[1:])\n")
+                            "'mcp_leash'] + sys.argv[1:])\n")
                 proc = subprocess.run(
                     [sys.executable, "-c", launcher, "--policy", pol, "--",
                      sys.executable, "-c", "pass"],
@@ -5638,7 +5641,7 @@ class TestClosedStandardStreams(ProxyCase):
 
 
 class TestClosedStandardError(ProxyCase):
-    """R7 mcp-jail #2: started with its standard error closed (`2>&-`; pythonw
+    """R7 mcp-leash #2: started with its standard error closed (`2>&-`; pythonw
     on Windows), Python has None for sys.stderr, and print(..., file=None)
     writes to standard OUTPUT: "server did not answer 1 request" landed in the
     protocol stream, and in the policy `learn` writes, while the messages
@@ -5740,7 +5743,7 @@ class TestClosedStandardError(ProxyCase):
         # asking for the help or the version is not a complaint
         code, shown = self.quiet_exit(cli_mod.main, ["--version"])
         self.assertEqual(code, 0)
-        self.assertIn("mcp-jail", shown)
+        self.assertIn("mcp-leash", shown)
 
     def test_a_stderr_that_cannot_be_written_to_ends_nothing(self):
         class Gone:
@@ -5760,7 +5763,7 @@ class TestClosedStandardError(ProxyCase):
     CLOSE_FD_2 = ("import os, sys\n"
                   "os.close(2)\n"
                   "os.execv(sys.executable, [sys.executable, '-m', "
-                  "'mcp_jail'] + sys.argv[1:])\n")
+                  "'mcp_leash'] + sys.argv[1:])\n")
 
     def with_stderr_closed(self, argv, stdin: bytes = b""):
         return subprocess.run(
@@ -5804,7 +5807,7 @@ class TestClosedStandardError(ProxyCase):
         # sys.stderr.write is an AttributeError: every notice goes through
         # jail._say, which knows both (the tests above run the paths that
         # matter; this one covers the ones they do not)
-        pkg = os.path.join(REPO, "mcp_jail")
+        pkg = os.path.join(REPO, "mcp_leash")
         names = sorted(n for n in os.listdir(pkg) if n.endswith(".py"))
         self.assertIn("jail.py", names)
         for name in names:
@@ -5998,7 +6001,7 @@ def _default_signals():
 
 
 class RealJail:
-    """mcp-jail as a program of its own (so that it can be sent signals),
+    """mcp-leash as a program of its own (so that it can be sent signals),
     wrapping FAKE_SIGNALLED. Its output goes to files: nothing to fill up."""
 
     def __init__(self, case, mode, grace, args=(), command=None):
@@ -6013,7 +6016,7 @@ class RealJail:
         self._out = open(os.path.join(case.tmp, "jail.out"), "wb")
         self._err = open(self.err_path, "wb")
         self.proc = subprocess.Popen(
-            [sys.executable, "-m", "mcp_jail"] + cmd + list(args) + ["--"] + server,
+            [sys.executable, "-m", "mcp_leash"] + cmd + list(args) + ["--"] + server,
             stdin=subprocess.PIPE, stdout=self._out, stderr=self._err,
             env=child_env(),
             preexec_fn=_default_signals if os.name == "posix" else None)
@@ -6038,7 +6041,7 @@ class RealJail:
         try:
             return self.proc.wait(timeout=limit)
         except subprocess.TimeoutExpired:
-            raise AssertionError(f"mcp-jail did not end within {limit}s")
+            raise AssertionError(f"mcp-leash did not end within {limit}s")
 
     def stderr(self) -> str:
         self._err.flush()
@@ -6316,7 +6319,7 @@ class TestStopSignalsInTheLoop(ProxyCase):
 
     @unittest.skipUnless(hasattr(signal, "SIGHUP"), "POSIX signals")
     def test_a_signal_that_was_being_ignored_still_is(self):
-        # nohup mcp-jail ...: the caller asked not to be hung up on
+        # nohup mcp-leash ...: the caller asked not to be hung up on
         pol = write_policy(self.tmp, ALLOW_ALL)
         old = signal.signal(signal.SIGHUP, signal.SIG_IGN)
         seen = []

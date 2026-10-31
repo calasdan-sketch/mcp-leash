@@ -1,12 +1,12 @@
-"""mcp-jail: runtime permission firewall for MCP servers.
+"""mcp-leash: runtime permission firewall for MCP servers.
 
 A stdio proxy that enforces a JSON policy on every tool call. mcp-audit
-finds the problems; mcp-jail enforces least-privilege at runtime.
+finds the problems; mcp-leash enforces least-privilege at runtime.
 
-  mcp-jail --policy policy.json -- npx -y some-mcp-server
-  mcp-jail --init-policy                # write an annotated starter policy
-  mcp-jail --audit                      # show the audit log
-  mcp-jail learn --script calls.json --out policy.json -- <server cmd>
+  mcp-leash --policy policy.json -- npx -y some-mcp-server
+  mcp-leash --init-policy                # write an annotated starter policy
+  mcp-leash --audit                      # show the audit log
+  mcp-leash learn --script calls.json --out policy.json -- <server cmd>
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ def _pipe_gone(exc: BaseException) -> bool:
 
 
 def _broken_pipe() -> int:
-    """stdout's reader went away (`mcp-jail --audit | head`): leave
+    """stdout's reader went away (`mcp-leash --audit | head`): leave
     quietly. stdout is pointed at the null device first so the
     interpreter's exit-time flush cannot raise the same error again."""
     try:
@@ -178,7 +178,7 @@ def cmd_audit(args) -> int:
 
 def cmd_learn(argv: list[str]) -> int:
     p = _Parser(
-        prog="mcp-jail learn",
+        prog="mcp-leash learn",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Observe a server session and generate a tight-fit "
                     "allowlist policy: only the tools actually called, with "
@@ -199,14 +199,14 @@ def cmd_learn(argv: list[str]) -> int:
                         "SIGTERM (default: 5; 0 stops it at once)")
     p.add_argument("server", nargs=argparse.REMAINDER,
                    help="server command after -- : "
-                        "mcp-jail learn --script c.json -- <cmd>")
+                        "mcp-leash learn --script c.json -- <cmd>")
     args = p.parse_args(argv)
     cmd = list(args.server)
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if not cmd:
         jail_mod._say("error: no server command: "
-                      "mcp-jail learn [--script c.json] [--out p.json] "
+                      "mcp-leash learn [--script c.json] [--out p.json] "
                       "-- <cmd>")
         return 2
     return jail_mod.learn(cmd, script=args.script, out=args.out,
@@ -216,9 +216,9 @@ def cmd_learn(argv: list[str]) -> int:
 def build_parser() -> argparse.ArgumentParser:
     default_policy = jail_mod.default_policy_path()
     p = _Parser(
-        prog="mcp-jail", description=__doc__,
+        prog="mcp-leash", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="subcommand: mcp-jail learn --help\n\n"
+        epilog="subcommand: mcp-leash learn --help\n\n"
                "exit status: 0 a clean session; 2 an unusable policy or "
                "command; 3 the server failed (it exited or closed its pipes, "
                "stopped reading its input, or did not answer a request "
@@ -255,7 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "at once)")
     p.add_argument("server", nargs=argparse.REMAINDER,
                    help="server command after -- : "
-                        "mcp-jail --policy p.json -- npx -y srv")
+                        "mcp-leash --policy p.json -- npx -y srv")
     return p
 
 
@@ -272,7 +272,7 @@ def _main(argv: list[str]) -> int:
         cmd = cmd[1:]
     if not cmd:
         jail_mod._say("error: no server command: "
-                      "mcp-jail --policy p.json -- <cmd>")
+                      "mcp-leash --policy p.json -- <cmd>")
         return 2
     return jail_mod.run(args.policy, cmd, timeout=args.timeout,
                         grace=args.grace)

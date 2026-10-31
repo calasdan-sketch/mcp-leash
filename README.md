@@ -1,7 +1,9 @@
-# mcp-jail (`mcp-jail`)
+# mcp-leash (`mcp-leash`)
+
+Formerly mcp-jail. The old `mcp-jail` command still works as an alias, and an existing `~/.mcp-jail` directory (policy, audit log) is still read when `~/.mcp-leash` does not exist. It is a policy filter, not a sandbox (see below).
 
 Runtime permission firewall for MCP servers. mcp-audit *finds* the
-problems; mcp-jail *enforces* least-privilege at the moment a tool call
+problems; mcp-leash *enforces* least-privilege at the moment a tool call
 fires. It's a stdio proxy: it sits between your MCP client and the real
 server, checks every `tools/call` against a JSON policy, and forwards or
 denies. Denied calls get a JSON-RPC error plus an append-only audit-log
@@ -18,13 +20,13 @@ Zero client changes: swap the server command for the jail wrapper.
 
 ```json
 "my-server": {
-  "command": "mcp-jail",
-  "args": ["--policy", "~/.mcp-jail/policy.json",
+  "command": "mcp-leash",
+  "args": ["--policy", "~/.mcp-leash/policy.json",
            "--", "npx", "-y", "some-mcp-server"]
 }
 ```
 
-`~` and environment variables in `--policy` are expanded by mcp-jail
+`~` and environment variables in `--policy` are expanded by mcp-leash
 itself (the client passes these arguments straight from its JSON config,
 no shell in between). The server command is looked up on `PATH` the way
 the OS does — on Windows `npx` resolves to `npx.cmd` — and a command that
@@ -38,25 +40,25 @@ Zero dependencies — Python 3.10+ stdlib only.
 
 ```bash
 pip install git+https://github.com/calasdan-sketch/mcp-jail
-mcp-jail --version
+mcp-leash --version
 ```
 
 ## Usage
 
 ```bash
-mcp-jail --init-policy                       # annotated starter policy
-mcp-jail --init-policy --path my.json        # ... written there, not to ~/.mcp-jail/policy.json
-mcp-jail --init-policy --force               # ... over a file that is already there
-mcp-jail --policy policy.json -- npx -y some-mcp-server
-mcp-jail --policy policy.json --timeout 10 -- npx -y some-mcp-server
-mcp-jail --policy policy.json --grace 10 -- npx -y some-mcp-server
-mcp-jail --audit                             # who got denied lately
-mcp-jail learn --script calls.json --out policy.json -- npx -y some-mcp-server
-mcp-jail --help                              # every flag, explained
+mcp-leash --init-policy                       # annotated starter policy
+mcp-leash --init-policy --path my.json        # ... written there, not to ~/.mcp-leash/policy.json
+mcp-leash --init-policy --force               # ... over a file that is already there
+mcp-leash --policy policy.json -- npx -y some-mcp-server
+mcp-leash --policy policy.json --timeout 10 -- npx -y some-mcp-server
+mcp-leash --policy policy.json --grace 10 -- npx -y some-mcp-server
+mcp-leash --audit                             # who got denied lately
+mcp-leash learn --script calls.json --out policy.json -- npx -y some-mcp-server
+mcp-leash --help                              # every flag, explained
 ```
 
-`--init-policy` writes `~/.mcp-jail/policy.json`
-(`%USERPROFILE%\.mcp-jail\policy.json` on Windows), creating the
+`--init-policy` writes `~/.mcp-leash/policy.json`
+(`%USERPROFILE%\.mcp-leash\policy.json` on Windows), creating the
 directory; `--path FILE` writes it there instead. It refuses to replace a
 file that is already there (one line on stderr, exit `2`) unless you add
 `--force`.
@@ -80,7 +82,7 @@ Policy (`policy.json`):
 }
 ```
 
-The policy is checked when mcp-jail starts, and anything it cannot read
+The policy is checked when mcp-leash starts, and anything it cannot read
 unambiguously is refused (exit `2`, the server is never started): an
 **unknown key** at any level — the top level, or inside an `arg_rules`
 entry, which takes only `allow` and `deny` — with a suggestion
@@ -151,8 +153,8 @@ A policy path that is a directory, or cannot be read, is the same exit
   so the agent never sees them. A hidden tool's `tools/call` is denied
   too. Argument rules never hide a tool — they are decided per call.
 
-Every allowed/denied call lands in `~/.mcp-jail/audit.jsonl`
-(`%USERPROFILE%\.mcp-jail\audit.jsonl` on Windows): tool, decision,
+Every allowed/denied call lands in `~/.mcp-leash/audit.jsonl`
+(`%USERPROFILE%\.mcp-leash\audit.jsonl` on Windows): tool, decision,
 reason, timestamp. A message the jail would not relay at all (see
 *Protocol handling*) is a `deny` record too, with `rejected` set to
 `client` or `server` and no tool. The file is created with mode `0600`
@@ -174,32 +176,32 @@ stopped reading (its pipe is full: it hung, deadlocked, or is busy for
 good) cannot freeze the jail. A message that has waited longer than N
 seconds to be taken is a stall: every request still waiting gets
 `-32603 server stopped reading its input`, the server is killed, and
-mcp-jail exits `3`.
+mcp-leash exits `3`.
 
 `--grace N` (default 5; `0` stops the server at once): when the client
-closes its input and every request has been answered, mcp-jail does what
+closes its input and every request has been answered, mcp-leash does what
 the MCP stdio transport asks of a client that is leaving. It finishes
 writing what is queued, closes the server's stdin, and waits up to N
 seconds for the server to finish and exit, relaying (and checking, and
 auditing) whatever the server still says meanwhile, a last notification
 for one. A server still running after N seconds is sent SIGTERM (on
 Windows `terminate()`, which ends it outright) and, if it ignores that
-for five more seconds, is killed; mcp-jail says so on stderr and still
+for five more seconds, is killed; mcp-leash says so on stderr and still
 exits `0`. A session that failed (exit `3`) does not wait. So a burst of
 notifications sent just before the client went away reaches the server in
 full, which `--grace 0` (stop the server as soon as the jail's own work is
-done, the way mcp-jail used to) can lose. `learn` without `--script` ends
+done, the way mcp-leash used to) can lose. `learn` without `--script` ends
 its session the same way and takes `--grace` too.
 
 **Signals.** SIGTERM and SIGHUP end a session the way the client leaving
-does: mcp-jail stops reading the client, closes the server's stdin once
+does: mcp-leash stops reading the client, closes the server's stdin once
 what is queued is written, waits up to `--grace` for the server to exit
 (relaying, checking and auditing whatever it still says), stops it if it
 does not, and exits `143` or `129` (128 plus the signal number). If the
-client had already left, so that mcp-jail was waiting out `--grace`, the
+client had already left, so that mcp-leash was waiting out `--grace`, the
 signal ends the wait. A second signal does not wait at all: the server is
-killed and mcp-jail ends at once. Ctrl-C (SIGINT) stops the server at once
-and exits `0`, as before. A signal that was being ignored when mcp-jail
+killed and mcp-leash ends at once. Ctrl-C (SIGINT) stops the server at once
+and exits `0`, as before. A signal that was being ignored when mcp-leash
 started (`nohup` does that for SIGHUP) still is. On Windows there is no
 SIGTERM or SIGHUP to catch: Ctrl-Break (SIGBREAK) takes the same path
 (exit `149`, 128 plus its number, 21), and closing the console window or
@@ -208,7 +210,7 @@ logging off ends the process outright, with no chance to tidy up.
 writes the policy; `learn --script` drives the server from a single thread
 and does not catch them.
 
-`mcp-jail --audit` shows the last 50 records, or the last N with
+`mcp-leash --audit` shows the last 50 records, or the last N with
 `--limit N` (a whole number, 1 or more: anything else is exit `2`). Each
 record is one line of printable text: `allow` or `DENY`, the tool (or the
 method, or `client message` / `server message` for a message the jail
@@ -225,7 +227,7 @@ report or drive your terminal.
 | `0`  | a clean session: the client finished and every request it sent was answered (a denied call is the jail doing its job, not a failure); or `--audit` / `--init-policy` / `learn` succeeded |
 | `2`  | unusable input: a policy that is missing or refused (the server is never started), a server command that is not found or not executable, an option value that is not a finite number of seconds (or a `--limit` below 1), a standard input or output that is closed (there is no client to talk to: one line on stderr, the server is never started), a `learn` session that ended early |
 | `3`  | the server failed while the jail was relaying: it exited or closed its pipes while the client was still talking to it, stopped reading its input, or left a request unanswered past `--timeout` |
-| `143`, `129` | mcp-jail was told to stop by SIGTERM or SIGHUP and wound the session down first (128 plus the signal number; see *Signals* above) |
+| `143`, `129` | mcp-leash was told to stop by SIGTERM or SIGHUP and wound the session down first (128 plus the signal number; see *Signals* above) |
 
 A wrapper (a CI job, a supervisor) can rely on the exit status for what
 happened to the requests the client made, and on a line on stderr that
@@ -284,7 +286,7 @@ denied too.
   empty object or array at a path without a rule (`{"type": "array"}`
   admits an empty array; `learn` writes such a rule when it saw one).
   Anchor allow patterns: in an allow pattern `$` always means *end of
-  the value* — mcp-jail compiles it as `\Z`, because Python's `$` also
+  the value* — mcp-leash compiles it as `\Z`, because Python's `$` also
   matches just before a trailing newline, and `^ls$` must not admit
   `"ls\n"`. (`learn` writes `\A...\Z` outright.)
 - **`..` is never allowed in by accident**: a value containing a `..`
@@ -325,7 +327,7 @@ shell at all. One more caveat, same honesty:
 
 ## learn: generate a policy from observed traffic
 
-Instead of hand-writing regexes, watch the server and let mcp-jail
+Instead of hand-writing regexes, watch the server and let mcp-leash
 write the tightest-fit allowlist: only the tools actually **called and
 answered successfully** (no `*`; tools the server merely listed are
 reported under `_not_called` and denied), and per-argument **typed**
@@ -347,13 +349,13 @@ Two modes:
 
 ```bash
 # (a) scripted: drive canned calls against the server, no client needed
-mcp-jail learn --script calls.json --out policy.json -- npx -y some-mcp-server
+mcp-leash learn --script calls.json --out policy.json -- npx -y some-mcp-server
 
 # (b) live: proxy a real session until stdin EOF or Ctrl-C, then emit
-mcp-jail learn --out policy.json -- npx -y some-mcp-server
+mcp-leash learn --out policy.json -- npx -y some-mcp-server
 ```
 
-In scripted mode mcp-jail is the MCP client: it performs the real
+In scripted mode mcp-leash is the MCP client: it performs the real
 handshake (`initialize` with `protocolVersion`, `capabilities` and
 `clientInfo`, then `notifications/initialized`) before `tools/list` and
 the calls — servers built on the official SDKs answer `-32602` to
@@ -407,7 +409,7 @@ in it (a policy takes `*` only on its own, as every tool, and an
 `arg_rules` key names one tool), and names that are one name once
 normalised (`Read` and `read`: the jail compares names ignoring case, so
 a policy could not tell them apart). `learn` used to write those into a
-policy that mcp-jail then refused to load. The summary counts them
+policy that mcp-leash then refused to load. The summary counts them
 (`allowlisted the 2 called (1 left out)`).
 
 The policy goes to stdout or `--out`; a short summary (tools listed,
@@ -462,7 +464,7 @@ The jail is a transparent JSON-RPC relay apart from the policy check:
   `server` (the offending line, cut to 200 characters, is kept unless
   `audit_args` is `none`).
   Integers of up to 4300 digits are exact (Python's own limit on reading
-  one, which mcp-jail applies on every Python version: a longer one is a
+  one, which mcp-leash applies on every Python version: a longer one is a
   number the jail cannot carry, so the message is refused like `1e999`);
   a decimal with more digits than an IEEE double holds is rounded to the
   nearest double, as every double-based parser would (see *Limitations*).
@@ -519,8 +521,8 @@ The jail is a transparent JSON-RPC relay apart from the policy check:
 - When the server exits, pending requests fail with `-32603 server
   closed` and the proxy ends the session without a crash, even while
   the client still holds its stdin open - with exit status `3`. When
-  *our* stdout's reader goes away (`mcp-jail --audit | head`),
-  mcp-jail exits quietly.
+  *our* stdout's reader goes away (`mcp-leash --audit | head`),
+  mcp-leash exits quietly.
 - Wire format: newline-delimited JSON, UTF-8 regardless of console
   code page. Both pipes are pumped by reader threads into one queue —
   no `select()` on pipes — so it runs the same on Windows 11 as on
@@ -528,41 +530,41 @@ The jail is a transparent JSON-RPC relay apart from the policy check:
 
 ## Limitations
 
-What mcp-jail does not do, in plain words (the two caveats on deny
+What mcp-leash does not do, in plain words (the two caveats on deny
 patterns and on `learn` above apply as well):
 
-- **It is a policy filter, not a sandbox.** mcp-jail inspects JSON-RPC
+- **It is a policy filter, not a sandbox.** mcp-leash inspects JSON-RPC
   messages on the pipe. It does not confine the server *process*: the
   server you wrap still runs with your full user rights and can read
   files, open network connections and start programs on its own, on
   Windows, Linux and macOS alike. A denied `tools/call` never reaches the
   server; nothing stops a malicious server from doing harm outside the
   protocol. For that, run the server in a container, VM or separate
-  low-privilege account and use mcp-jail on top.
+  low-privilege account and use mcp-leash on top.
 - **What differs by platform.** Policy checking, the audit log, exit
   codes and `--grace` behave the same everywhere. File mode `0600` on the
   audit log and policy is enforced on POSIX and best effort on Windows
   (the per-user profile is the fence). SIGTERM/SIGHUP handling is POSIX;
   Windows has Ctrl-Break only, and `terminate()` ends the server outright.
   No platform gets process isolation, a file-system allowlist or a
-  network filter from mcp-jail.
+  network filter from mcp-leash.
 - **A URI in `allow_tools` is compared like a tool name**: NFKC-normalised
   and case-folded. A policy that allows `file:///srv/Public` also allows
   `file:///srv/public`, which on a case-sensitive file system is a
   different file. Deny entries want that folding; allow entries would
   rather not have it. Prefer `deny_tools` / `deny_methods` for resources,
   or keep to lowercase URIs.
-- **A stalled server is stopped by killing the process mcp-jail
+- **A stalled server is stopped by killing the process mcp-leash
   started.** A grandchild that still holds the server's stdin open
   (`npx` starting node) is not, and a write stuck on it can outlive the
-  stop; mcp-jail does not wait for it and exits regardless. One that
+  stop; mcp-leash does not wait for it and exits regardless. One that
   holds the server's *output* open is waited for, whether the server was
   killed or left on its own: the pipe cannot be closed under the thread
-  that is reading it, so mcp-jail exits when that grandchild lets go or
+  that is reading it, so mcp-leash exits when that grandchild lets go or
   ends.
 - **`learn` writes an argument name as a path.** A name with a `.` in it
   is read as nesting (`a.b` becomes `b` inside `a`, so the call it was
-  learned from is denied, and `a..b` or `.a` make mcp-jail refuse the
+  learned from is denied, and `a..b` or `.a` make mcp-leash refuse the
   file at start-up), and `*` or `**` as a wildcard. Read the generated
   file when a tool takes an argument named like that.
 - **Numbers are re-written as an IEEE double would write them.** Integers
@@ -587,7 +589,7 @@ python3 -m pytest -q                    # same suite
 
 Tests spawn fake MCP servers as subprocesses and point `HOME`,
 `USERPROFILE` and `APPDATA` at a throwaway directory, so they never
-touch your real `~/.mcp-jail`.
+touch your real `~/.mcp-leash`.
 
 ## License
 

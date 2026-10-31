@@ -36,4 +36,4 @@ jobs:
         run: |
           python -m venv "$RUNNER_TEMP/v"
           "$RUNNER_TEMP/v/bin/pip" install dist/*.whl
-          "$RUNNER_TEMP/v/bin/mcp-jail" --version
+          "$RUNNER_TEMP/v/bin/mcp-leash" --version

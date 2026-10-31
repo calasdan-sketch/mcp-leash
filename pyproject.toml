@@ -3,8 +3,8 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mcp-jail"
-version = "0.6.3"
+name = "mcp-leash"
+version = "0.7.0"
 description = "Runtime permission firewall for MCP servers (stdio proxy)"
 readme = "README.md"
 license = "MIT"
@@ -27,11 +27,12 @@ Homepage = "https://github.com/calasdan-sketch/mcp-jail"
 Issues = "https://github.com/calasdan-sketch/mcp-jail/issues"
 
 [project.scripts]
-mcp-jail = "mcp_jail.cli:main"
+mcp-leash = "mcp_leash.cli:main"
+mcp-jail = "mcp_leash.cli:main"  # old name, kept as an alias
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["mcp_jail*"]
+include = ["mcp_leash*"]
 
 [tool.ruff]
 line-length = 100
