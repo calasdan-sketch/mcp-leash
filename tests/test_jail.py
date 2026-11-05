@@ -1499,12 +1499,15 @@ class TestLearnedPolicyLoads(ProxyCase):
         self.assertTrue(all("stays denied" in n for n in notices), notices)
         self.assertIn("allowlisted the 1 called (3 left out)", err)
         # and the file starts the jail
+        # (as a client does: tools/list first, which the pins learn wrote need)
         pol_path = write_policy(self.tmp, json.loads(text))
-        code, raw = drive_rc(pol_path, [sys.executable, self.server],
-                             [call(1, "read_file", {"path": "/a"}),
-                              call(2, "search*", {"q": "x"})], timeout=10)
-        self.assertEqual(code, 0)
-        replies = {json.loads(r)["id"]: json.loads(r) for r in raw}
+        live = Live(pol_path, [sys.executable, self.server])
+        try:
+            live.ask({"jsonrpc": "2.0", "id": 0, "method": "tools/list"})
+            replies = {1: live.ask(call(1, "read_file", {"path": "/a"})),
+                       2: live.ask(call(2, "search*", {"q": "x"}))}
+        finally:
+            self.assertEqual(live.close(), 0)
         self.assertIn("result", replies[1])
         self.assertEqual(replies[2]["error"]["code"], -32602)
 
@@ -6566,37 +6569,123 @@ class TestAuditChain(ProxyCase):
         write_lines(jail_mod.AUDIT_LOG, lines)
         self.assertEqual(self.verify().line_no, 3)
 
-    def test_a_cut_last_line_is_reported_and_the_chain_goes_on_after_it(self):
+    def test_an_interrupted_write_is_recovered_not_tampering(self):
         self.write(2)
         with open(jail_mod.AUDIT_LOG, "ab") as f:
             f.write(b'{"tool": "half')            # a crash mid-write
         rep = self.verify()
-        self.assertIn("incomplete", rep.problem)
-        self.write(1)                            # starts on a line of its own
+        self.assertTrue(rep.ok, rep.problem)      # not yet recovered: noted
+        self.assertEqual(rep.torn_tail, len(b'{"tool": "half'))
+        ledger._cache.clear()                     # another process writes next
+        self.write(1)
         lines = read_lines(jail_mod.AUDIT_LOG)
         self.assertEqual(lines[2], b'{"tool": "half')
-        self.assertEqual(json.loads(lines[3])["prev"],
-                         ledger.digest(lines[2], "sha256", None))
+        rec = json.loads(lines[3])
+        self.assertEqual(rec["event"], "recovered")
+        self.assertEqual(rec["damaged"], ledger.digest(lines[2], "sha256", None))
+        self.assertEqual(rec["prev"], json.loads(lines[1])["hash"])
         rep = self.verify()
-        self.assertEqual(rep.line_no, 3)         # the damage stays on record
-
-    def test_an_anchor_catches_a_rewrite_and_a_cut(self):
-        self.write(3)
-        head = self.verify().head_hash
-        self.write(1)
-        self.assertTrue(ledger.verify(jail_mod.AUDIT_LOG, anchor=head).ok)
-        # cut back past the anchor: what is left is still a valid chain
-        lines = read_lines(jail_mod.AUDIT_LOG)
-        write_lines(jail_mod.AUDIT_LOG, lines[:2])
-        self.assertTrue(self.verify().ok)
-        rep = ledger.verify(jail_mod.AUDIT_LOG, anchor=head)
-        self.assertIn("anchor is not in the chain", rep.problem)
+        self.assertTrue(rep.ok, (rep.line_no, rep.problem))
+        self.assertEqual((rep.records, rep.recovered), (4, 1))
+        # a recovery record cannot vouch for another line
+        lines[2] = b'{"tool": "slipped in"}'
+        write_lines(jail_mod.AUDIT_LOG, lines)
+        self.assertEqual(self.verify().line_no, 3)
         out = io.StringIO()
         with redirect_stdout(out):
-            rc = cli_mod.main(["verify-audit", jail_mod.AUDIT_LOG,
-                               "--anchor", head])
-        self.assertEqual(rc, 1)
-        self.assertIn("anchor is not in the chain", out.getvalue())
+            cli_mod.main(["--audit"])
+        self.assertIn("note  audit log: an interrupted write", out.getvalue())
+
+    def test_a_torn_first_line_is_recovered_too(self):
+        with open(jail_mod.AUDIT_LOG, "wb") as f:
+            f.write(b'{"to')
+        self.write(1)
+        rep = self.verify()
+        self.assertTrue(rep.ok, (rep.line_no, rep.problem))
+        self.assertEqual((rep.recovered, rep.legacy), (1, 0))
+
+    def test_with_a_key_the_whole_log_must_be_keyed(self):
+        key = b"k3y"
+        with open(jail_mod.AUDIT_LOG, "wb"):
+            pass
+        rep = self.verify(key)
+        self.assertIn("no keyed records", rep.problem)
+        with open(jail_mod.AUDIT_LOG, "wb") as f:
+            f.write(b'{"tool": "old", "decision": "deny"}\n')
+        with mock.patch.dict(os.environ, {ledger.KEY_ENV: "k3y"}):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.write(2)
+        self.assertIn("not a keyed record", err.getvalue())
+        self.assertTrue(self.verify().ok is False)    # keyed: needs the key
+        rep = self.verify(key)
+        self.assertEqual(rep.line_no, 1)
+        self.assertIn("unchained line in a keyed log", rep.problem)
+        # an unkeyed chain checked with a key is refused, not accepted
+        os.remove(jail_mod.AUDIT_LOG)
+        ledger._cache.clear()
+        self.write(2)
+        rep = self.verify(key)
+        self.assertIn("unkeyed (sha256) record in a keyed log", rep.problem)
+
+    def test_a_different_key_is_named(self):
+        with mock.patch.dict(os.environ, {ledger.KEY_ENV: "one"}):
+            self.write(1)
+        ledger._cache.clear()
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {ledger.KEY_ENV: "two"}), \
+                redirect_stderr(err):
+            self.write(1)
+        self.assertIn("different one", err.getvalue())
+        self.assertIn("different key", self.verify(b"two").problem)
+        ledger._cache.clear()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.write(1)                         # no key at all
+        self.assertIn("no audit key is set", err.getvalue())
+
+    def test_key_file(self):
+        kf = os.path.join(self.tmp, "audit.key")
+        with open(kf, "wb") as f:
+            f.write(b"filekey\n")
+        if os.name != "nt":
+            os.chmod(kf, 0o644)
+            with mock.patch.dict(os.environ, {ledger.KEY_FILE_ENV: kf}):
+                with self.assertRaises(ledger.KeyProblem):
+                    ledger.audit_key()
+                pol = write_policy(self.tmp, ALLOW_ALL)
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    code, _ = drive_rc(pol, [sys.executable, self.server], [])
+                self.assertEqual(code, 2)
+                self.assertIn("chmod 600", err.getvalue())
+            os.chmod(kf, 0o600)
+        ledger._key_cache.clear()
+        with mock.patch.dict(os.environ, {ledger.KEY_FILE_ENV: kf}):
+            self.assertEqual(ledger.audit_key(), b"filekey")
+            self.write(1)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = cli_mod.main(["verify-audit", jail_mod.AUDIT_LOG])
+            self.assertEqual(rc, 0, out.getvalue())
+            with mock.patch.dict(os.environ, {ledger.KEY_ENV: "x"}):
+                with self.assertRaises(ledger.KeyProblem):
+                    ledger.audit_key()
+        for missing in (os.path.join(self.tmp, "nope"),):
+            with mock.patch.dict(os.environ, {ledger.KEY_FILE_ENV: missing}):
+                with self.assertRaises(ledger.KeyProblem):
+                    ledger.audit_key()
+        self.assertTrue(self.verify(b"filekey").ok)
+
+    def test_a_failed_append_is_loud_and_never_unlocked(self):
+        err = io.StringIO()
+        with mock.patch.object(ledger._FileLock, "__enter__",
+                               side_effect=OSError("cannot lock")), \
+                redirect_stderr(err):
+            jail_mod.audit({"tool": "t", "decision": "deny", "reason": "r"})
+        self.assertIn("AUDIT RECORD NOT WRITTEN for t (deny)", err.getvalue())
+        self.assertFalse(os.path.exists(jail_mod.AUDIT_LOG)
+                         and os.path.getsize(jail_mod.AUDIT_LOG))
 
     def test_crlf_rewrite_is_named(self):
         self.write(1)
@@ -6633,6 +6722,15 @@ class TestAuditChain(ProxyCase):
         pol = write_policy(self.tmp, ALLOW_ALL)
         with mock.patch.dict(os.environ, {ledger.KEY_ENV: "s3cret"}):
             resps = drive_jail(pol, srv, [call(1, "t", {})])
+        self.assertEqual(resps[0]["result"], {"k": "absent"})
+        kf = os.path.join(self.tmp, "k")
+        with open(kf, "wb") as f:
+            f.write(b"x")
+        os.chmod(kf, 0o600)
+        srv2 = self.srv(open(srv, encoding="utf-8").read().replace(
+            "'MCP_LEASH_AUDIT_KEY'", "'MCP_LEASH_AUDIT_KEY_FILE'"), "env2.py")
+        with mock.patch.dict(os.environ, {ledger.KEY_FILE_ENV: kf}):
+            resps = drive_jail(pol, srv2, [call(1, "t", {})])
         self.assertEqual(resps[0]["result"], {"k": "absent"})
 
     def test_session_records_name_the_policy(self):
@@ -6881,6 +6979,64 @@ class TestToolPins(ProxyCase):
         self.assertNotIn("\x1b", err.getvalue())
         self.assertNotIn("\u202e", err.getvalue())
 
+    def test_a_pinned_tool_waits_for_a_listing_that_shows_its_pin(self):
+        live = Live(self.policy(), self.cmd)
+        try:
+            r = live.ask(call(1, "read_file", {"path": "x"}))
+            self.assertIn("no tools/list in this session", r["error"]["message"])
+            live.ask({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+            r = live.ask(call(3, "read_file", {"path": "x"}))
+            self.assertIn("result", r)
+        finally:
+            self.assertEqual(live.close(), 0)
+
+    def test_a_pinned_tool_is_not_called_while_a_listing_is_in_flight(self):
+        # list and call sent together: the call is judged before the answer
+        resps = drive_jail(self.policy(), self.srv_path, [
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            call(2, "read_file", {"path": "x"})], server_args=[self.spec])
+        by_id = {r["id"]: r for r in resps}
+        self.assertIn("still unanswered", by_id[2]["error"]["message"])
+        self.assertEqual(len(by_id[1]["result"]["tools"]), 2)
+
+    def test_require_pins_allows_only_pinned_tools(self):
+        self.set_tools(PIN_TOOLS + [{"name": "new_tool"}])
+        pol = self.policy(require_pins=True, hide_denied=True)
+        live = Live(pol, self.cmd)
+        try:
+            names = [t["name"] for t in live.ask(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+                ["result"]["tools"]]
+            self.assertEqual(names, ["read_file", "search"])
+            r = live.ask(call(2, "new_tool", {}))
+            self.assertIn("has no pin (require_pins", r["error"]["message"])
+            self.assertIn("result", live.ask(call(3, "search", {})))
+        finally:
+            live.close()
+        with self.assertRaises(ValueError):
+            jail_mod.compile_policy({"require_pins": "yes"})
+
+    def test_a_look_alike_of_a_pinned_tool_is_hidden_and_denied(self):
+        fake = {"name": "rеad_file", "description": "evil"}  # Cyrillic e
+        self.set_tools(PIN_TOOLS + [fake, {"name": "read-file"},
+                                   {"name": "other"}])
+        err = io.StringIO()
+        live = Live(self.policy(), self.cmd)
+        try:
+            with redirect_stderr(err):
+                r = live.ask(call(1, "rеad_file", {}))
+                self.assertIn("confusable", r["error"]["message"])
+                names = [t["name"] for t in live.ask(
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+                    ["result"]["tools"]]
+            self.assertEqual(names, ["read_file", "search", "other"])
+            self.assertIn("result", live.ask(call(3, "read_file", {})))
+        finally:
+            live.close()
+        self.assertEqual(err.getvalue().count("confusable"), 2)
+        self.assertEqual(jail_mod.name_skeleton("RΕΑD_fiIe".replace("I", "l")),
+                         jail_mod.name_skeleton("read_file"))
+
     def test_an_unpinned_tool_is_judged_by_the_rest_of_the_policy(self):
         extra = {"name": "new_tool", "description": "?"}
         self.set_tools(PIN_TOOLS + [extra])
@@ -6948,16 +7104,29 @@ class TestPinCommand(TestToolPins):
         self.set_tools([dict(PIN_TOOLS[0], description="New\x1b[2Jtext"),
                         PIN_TOOLS[1]])
         rc, err = self.run_pin(pol, "--dry-run")
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)                   # a change to review
         self.assertIn("CHANGED 'read_file': New\\x1b[2Jtext", err)
         self.assertIn("dry run", err)
         with open(pol, "rb") as f:
             self.assertEqual(f.read(), before)
-        rc, err = self.run_pin(pol)
+        rc, err = self.run_pin(pol)               # not accepted yet
+        self.assertEqual(rc, 1)
+        self.assertIn("run again with --accept-changed", err)
+        with open(pol, "rb") as f:
+            self.assertEqual(f.read(), before)
+        rc, err = self.run_pin(pol, "--accept-changed")
         self.assertEqual(rc, 0)
         self.assertEqual(jail_mod.load_policy(pol)["tool_pins"]["read_file"],
                          jail_mod.tool_digest(dict(PIN_TOOLS[0],
                                                    description="New\x1b[2Jtext")))
+
+    def test_pin_will_not_pin_a_look_alike_of_a_pinned_tool(self):
+        pol = self.policy()
+        self.set_tools(PIN_TOOLS + [dict(PIN_TOOLS[0], name="rеad_file")])
+        rc, err = self.run_pin(pol)               # Cyrillic e above
+        self.assertEqual(rc, 0, err)
+        self.assertIn("confusable", err)
+        self.assertNotIn("rеad_file", jail_mod.load_policy(pol)["tool_pins"])
 
     def test_pin_follows_pages_and_keeps_pins_of_tools_gone(self):
         pol = write_policy(self.tmp, dict(ALLOW_ALL, tool_pins={
@@ -7024,6 +7193,40 @@ class TestCheckCommand(ProxyCase):
         rc, out, _ = self.check("--policy", pol, "--method", "ping", "x")
         self.assertEqual(rc, 0)
         self.assertIn("relayed unchecked", out)
+
+    def test_completion_is_judged_by_its_ref_as_the_proxy_does(self):
+        pol = write_policy(self.tmp, {
+            "allow_tools": ["greet", "file:///srv/public"],
+            "policed_methods": ["completion/complete", "resources/read"]})
+        rc, out, _ = self.check("--policy", pol, "--method",
+                                "completion/complete", "greet")
+        self.assertEqual(rc, 0, out)
+        rc, out, _ = self.check("--policy", pol, "--method",
+                                "completion/complete", "file:///etc/passwd")
+        self.assertEqual(rc, 1)
+        self.assertIn("not in allow_tools", out)
+        # a ref that is both kinds is refused, as the proxy refuses it
+        rc, out, _ = self.check("--policy", pol, "--method",
+                                "completion/complete", "--params",
+                                '{"ref": {"type": "ref/prompt", "name": "greet",'
+                                ' "uri": "file:///etc/passwd"}}')
+        self.assertEqual(rc, 1)
+        self.assertIn("also carries 'uri'", out)
+        rc, out, _ = self.check("--policy", pol, "--params",
+                                '{"name": "greet", "uri": "file:///x"}')
+        self.assertEqual(rc, 1)
+        self.assertIn("also carries 'uri'", out)
+
+    def test_pin_warnings(self):
+        good = "sha256:" + "a" * 64
+        pol = write_policy(self.tmp, dict(ALLOW_ALL, tool_pins={
+            "read_file": good, "rеad_file": good}))
+        rc, out, _ = self.check("--policy", pol)
+        self.assertIn("are confusable names", out)
+        self.assertIn("require_pins: true allows only pinned tools", out)
+        pol = write_policy(self.tmp, {"require_pins": True})
+        rc, out, _ = self.check("--policy", pol)
+        self.assertIn("every tool is denied", out)
 
     def test_bad_input_is_exit_2(self):
         pol = write_policy(self.tmp, ALLOW_ALL)

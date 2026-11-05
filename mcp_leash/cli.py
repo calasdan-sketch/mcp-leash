@@ -170,6 +170,9 @@ def cmd_audit(args) -> int:
         denies += denied
         mark = "DENY " if denied else "allow"
         what = e.get("tool")
+        if what is None and e.get("event") == "recovered":
+            print(f"note  audit log: {_plain(e.get('reason', ''))}")
+            continue
         if what is None:
             if e.get("rejected") is not None:  # a message the jail would not relay
                 what = f"{_plain(e['rejected'])} message"
@@ -243,6 +246,10 @@ def cmd_pin(argv: list[str]) -> int:
                         "(default: 30; 0 waits for ever)")
     p.add_argument("--dry-run", action="store_true",
                    help="show what would change, write nothing")
+    p.add_argument("--accept-changed", action="store_true",
+                   help="replace the pins of tools whose definition changed "
+                        "(without it they keep their old pin, stay denied, "
+                        "and the exit status is 1)")
     p.add_argument("server", nargs=argparse.REMAINDER,
                    help="server command after -- ")
     args = p.parse_args(argv)
@@ -252,7 +259,8 @@ def cmd_pin(argv: list[str]) -> int:
                       "mcp-leash pin --policy p.json -- <cmd>")
         return 2
     return jail_mod.pin(args.policy, cmd, timeout=args.timeout,
-                        dry_run=args.dry_run)
+                        dry_run=args.dry_run,
+                        accept_changed=args.accept_changed)
 
 
 def cmd_check(argv: list[str]) -> int:
@@ -272,14 +280,19 @@ def cmd_check(argv: list[str]) -> int:
                    help=f"policy file (default: {default_policy})")
     p.add_argument("--method", default="tools/call",
                    help="JSON-RPC method of the call (default: tools/call); "
-                        "for resources/read give the URI as TOOL")
+                        "for resources/read give the URI as TOOL; for "
+                        "completion/complete a URI or a prompt name, made "
+                        "into the ref the proxy judges")
+    p.add_argument("--params", metavar="JSON",
+                   help="the call's whole params object, judged exactly as "
+                        "the proxy judges it (instead of TOOL and ARGS)")
     p.add_argument("tool", nargs="?", help="tool name (or URI)")
     p.add_argument("arguments", nargs="?",
                    help="the call's arguments as a JSON object "
                         "(default: {})")
     args = p.parse_args(argv)
     return jail_mod.check(args.policy, args.tool, args.arguments,
-                          method=args.method)
+                          method=args.method, params_text=args.params)
 
 
 def cmd_verify_audit(argv: list[str]) -> int:
@@ -289,8 +302,9 @@ def cmd_verify_audit(argv: list[str]) -> int:
         description="Check the audit log's hash chain: every record must "
                     "match its hash and link to the one before it, so an "
                     "edited, deleted, inserted or reordered record is found. "
-                    f"Records written with {ledger.KEY_ENV} set are "
-                    "HMAC-keyed and need the same key here. Prints the head "
+                    f"Records written with an audit key ({ledger.KEY_FILE_ENV}"
+                    f" or {ledger.KEY_ENV}) are HMAC-keyed and need the same "
+                    "key here; with a key, every record must be keyed. Prints the head "
                     "(last seq and hash): keep a copy elsewhere to catch "
                     "records cut off the end.\n\nexit status: 0 intact, "
                     "1 broken (the first bad line is named), 2 no log")
@@ -305,6 +319,9 @@ def cmd_verify_audit(argv: list[str]) -> int:
             else jail_mod.audit_log_path())
     try:
         rep = ledger.verify(path, ledger.audit_key(), anchor=args.anchor)
+    except ledger.KeyProblem as e:
+        jail_mod._say(f"mcp-leash verify-audit: audit key: {e}")
+        return 2
     except FileNotFoundError:
         jail_mod._say(f"mcp-leash verify-audit: no audit log at {path}")
         return 2
@@ -318,8 +335,15 @@ def cmd_verify_audit(argv: list[str]) -> int:
         return 1
     legacy = (f"; {rep.legacy} older unchained line(s) at the start"
               if rep.legacy else "")
+    recovered = (f"; {rep.recovered} interrupted write(s), marked recovered"
+                 if rep.recovered else "")
     algs = "/".join(sorted(rep.algs)) or "none"
-    print(f"OK {path}: {rep.records} chained record(s) ({algs}){legacy}")
+    print(f"OK {path}: {rep.records} chained record(s) ({algs})"
+          f"{legacy}{recovered}")
+    if rep.torn_tail:
+        print(f"  note: the last line is incomplete ({rep.torn_tail} bytes: "
+              f"an interrupted write); the next record mcp-leash writes "
+              f"marks it recovered")
     if rep.records:
         print(f"  head: seq {rep.head_seq} {rep.head_hash}")
     return 0

@@ -138,12 +138,21 @@ mcp-leash --audit                             # who got denied lately
 mcp-leash learn --script calls.json --out policy.json -- npx -y some-mcp-server
 mcp-leash pin --policy policy.json -- npx -y some-mcp-server   # pin tool definitions
 mcp-leash pin --policy policy.json --dry-run -- npx -y some-mcp-server
+mcp-leash pin --policy policy.json --accept-changed -- npx -y some-mcp-server
 mcp-leash check --policy policy.json          # summary + warnings, no server
 mcp-leash check --policy policy.json run_cmd '{"cmd": "ls"}'   # one decision
+mcp-leash check --policy policy.json --method prompts/get --params '{"name": "greet"}'
 mcp-leash verify-audit                        # is the audit log intact?
 mcp-leash verify-audit --anchor sha256:...    # ... and does it still hold that head?
 mcp-leash --help                              # every flag, explained
+mcp-leash -- check                            # a server command named like a subcommand
 ```
+
+`learn`, `pin`, `check` and `verify-audit` are subcommands when they come
+first. **Breaking change in 0.8.0:** a server command whose name is `pin`,
+`check` or `verify-audit`, given first (`mcp-leash check ...`), is now read as
+the subcommand. Put `--` before it (`mcp-leash --policy p.json -- check`),
+which has always worked and is what the client config above does.
 
 `--init-policy` writes `~/.mcp-leash/policy.json`
 (`%USERPROFILE%\.mcp-leash\policy.json` on Windows), creating the
@@ -245,6 +254,8 @@ A policy path that is a directory, or cannot be read, is the same exit
   definition as the server listed it (see *Tool pins* below). `learn` and
   `pin` write them; keys are compared normalised like `allow_tools`, and a
   malformed pin is refused at start-up.
+- `require_pins` (default `false`): when `true`, a tool without a pin is
+  denied by name (and hidden by `hide_denied`), whatever `allow_tools` says.
 
 Every allowed/denied call lands in `~/.mcp-leash/audit.jsonl`
 (`%USERPROFILE%\.mcp-leash\audit.jsonl` on Windows): tool, decision,
@@ -320,7 +331,7 @@ report or drive your terminal.
 | code | meaning |
 |------|---------|
 | `0`  | a clean session: the client finished and every request it sent was answered (a denied call is the jail doing its job, not a failure); or `--audit` / `--init-policy` / `learn` succeeded |
-| `1`  | `check`: the call would be denied; `verify-audit`: the chain is broken (or `--anchor` is not in it) |
+| `1`  | `check`: the call would be denied; `verify-audit`: the chain is broken (or `--anchor` is not in it); `pin`: a changed tool was left at its old pin (no `--accept-changed`) |
 | `2`  | unusable input: a policy that is missing or refused (the server is never started), a server command that is not found or not executable, an option value that is not a finite number of seconds (or a `--limit` below 1), a standard input or output that is closed (there is no client to talk to: one line on stderr, the server is never started), a `learn` session that ended early |
 | `3`  | the server failed while the jail was relaying: it exited or closed its pipes while the client was still talking to it, stopped reading its input, or left a request unanswered past `--timeout` |
 | `143`, `129` | mcp-leash was told to stop by SIGTERM or SIGHUP and wound the session down first (128 plus the signal number; see *Signals* above) |
@@ -539,22 +550,35 @@ field except `_meta` — name, title, description, inputSchema, outputSchema,
 annotations. Key order and spacing do not change a pin; any change of text
 does. While mcp-leash runs:
 
+- a pinned tool is **callable only once a `tools/list` of this session has
+  shown its pinned definition**, and not while any `tools/list` is still
+  unanswered (the answer could change it): such a call is denied with a
+  reason that says to list first. MCP clients list tools before calling
+  them, so in practice this only stops a call that skips the check;
 - a pinned tool listed with a different definition is **removed from that
   `tools/list` answer** (whatever `hide_denied` says), a line goes to stderr,
   and the audit log gets one `deny` record with the `pinned` and `seen`
-  hashes;
-- from then on, **every `tools/call` of that tool is denied** for the rest of
+  hashes; from then on **every `tools/call` of it is denied** for the rest of
   the session, even if the server lists the old definition again;
-- tools without a pin are judged by the rest of the policy as before (with a
-  `learn`ed allowlist, an unpinned tool is not allowed anyway).
+- a tool whose name **looks like** a pinned one (`rеad_file` with a Cyrillic
+  `е`, `read-file`, `read_fi1e`: same name once accents are dropped and
+  common Cyrillic/Greek look-alike letters, `0`/`1` and `-` are mapped) is
+  hidden and denied the same way. This is a short look-alike table, not the
+  full Unicode confusables list;
+- other tools without a pin are judged by the rest of the policy (with a
+  `learn`ed allowlist an unpinned tool is not allowed anyway); set
+  `"require_pins": true` to deny every tool that has no pin.
 
 `learn` pins every tool it allowlists (a tool listed twice with different
 definitions during learning is not pinned, and says so). For an existing
 policy, `mcp-leash pin --policy FILE -- <server>` starts the server, reads
 every `tools/list` page, and writes the pins of the tools the policy allows
-by name. A new or changed tool is printed with its description first, so a
-re-pin after a server upgrade is a review, not a rubber stamp; `--dry-run`
-writes nothing. Pins of tools the server no longer lists are kept. The file
+by name. A new or changed tool is printed with its description first. A
+**changed** tool keeps its old pin (so stays denied) and the exit status is
+`1` until you run it again with `--accept-changed`: a re-pin after a server
+upgrade is a review, not a rubber stamp. New tools are pinned (unless the
+name looks like an already pinned one); `--dry-run` writes nothing. Pins of
+tools the server no longer lists are kept. The file
 is replaced atomically and keeps its permissions. A server that cannot be
 started, refuses the handshake or goes away leaves the policy untouched
 (exit `2`).
@@ -578,18 +602,56 @@ mcp-leash verify-audit path/to/audit.jsonl
 
 names the first line where it breaks (`the record does not match its hash:
 edited`, `the link to the previous record is broken`, `a line without a hash
-inside the chain`, `the last line is incomplete`, `line ends in CR LF`).
-Several mcp-leash processes writing one log (one per wrapped server) take a
-file lock around each append, so the chain never forks. A log written by an
-older mcp-leash is carried on: its lines are counted as unchained, and the
-first new record links to the last old line.
+inside the chain`, `line ends in CR LF`).
 
-With `MCP_LEASH_AUDIT_KEY` set in mcp-leash's environment, the hashes are
-HMAC-SHA256 under that key (`"hmac-sha256:..."`): someone who can write the
-file but lacks the key cannot rebuild a consistent chain. `verify-audit`
-needs the same variable, and a keyed chain followed by unkeyed records is
-reported as broken. The key is removed from the environment of the server
-mcp-leash starts.
+Several mcp-leash processes writing one log (one per wrapped server) take a
+lock around each append, so the chain never forks: `flock` on the log on
+POSIX; on Windows a separate `audit.jsonl.lock` file, so the log itself is
+never locked against readers. A lock that cannot be had within 30 seconds
+means the record is **not written** (never written unlocked), and every
+record that cannot be written says so on stderr: `AUDIT RECORD NOT WRITTEN
+for <tool> (<decision>) ...`. The decision itself still stands.
+
+An interrupted write (power cut, killed process) can leave the last line
+incomplete. `verify-audit` notes it; the next append ends that line and
+writes an `"event": "recovered"` record that names it by hash and links to
+the last good record, and `verify-audit` then reports it as recovered, not
+as tampering (`--audit` shows it as a `note`). A log written by an older
+mcp-leash is carried on: its lines are counted as unchained, and the first
+new record links to the last old line.
+
+**Keyed logs.** With an audit key, the hashes are HMAC-SHA256 under it
+(`"hmac-sha256:..."`): someone who can write the file but lacks the key
+cannot rebuild a consistent chain. Put the key in a file only you can read
+and name it in `MCP_LEASH_AUDIT_KEY_FILE`:
+
+```bash
+python -c "import secrets; print(secrets.token_hex(32))" > ~/.mcp-leash/audit.key
+chmod 600 ~/.mcp-leash/audit.key
+# in the client config: "env": {"MCP_LEASH_AUDIT_KEY_FILE": "~/.mcp-leash/audit.key"}
+MCP_LEASH_AUDIT_KEY_FILE=~/.mcp-leash/audit.key mcp-leash verify-audit
+```
+
+mcp-leash reads the file and never puts the key in an environment. A key
+file that others can read (POSIX), is empty or missing stops mcp-leash at
+start-up (exit `2`). `MCP_LEASH_AUDIT_KEY` (the key itself in a variable)
+still works but is weaker: on Linux any process of the same user can read
+mcp-leash's starting environment from `/proc/<pid>/environ`. Both variables
+are removed from the environment of the server mcp-leash starts; setting
+both is refused.
+
+When a key is given, `verify-audit` demands a keyed log throughout: every
+record `hmac-sha256` under that key, no unchained (older) lines, not empty.
+A record under another key is reported as `written with a different key`,
+and mcp-leash warns on stderr when it appends to a log whose last record was
+written with another key or none.
+
+**Not contained:** the server you wrap runs as your user. It can read
+anything you can, the key file included, and write to the log. A key stops
+someone who only gets at the log file (a backup, a sync folder, another
+account); it does not stop a malicious server running as you. For that, run
+the server as another user or in a container, with the key file out of its
+reach.
 
 What a chain alone cannot show: records cut off the **end** of the file
 (what is left is still a valid chain), or, without a key, a log rewritten
@@ -603,12 +665,18 @@ cut back past that record, or rebuilt, no longer contains it (exit `1`).
 (exit `2` with the same message if it would be refused), summarises it, and
 warns about settings that are legal but weaker than they look: `allow_tools`
 `*`, an `allow: "*"` with no deny rules, `audit_args: "all"`, no `tool_pins`,
-`hide_denied: false`.
+pins without `require_pins` while every tool is allowed, `require_pins` with
+nothing pinned, pinned or allowed names that look alike, `hide_denied:
+false`.
 
 `mcp-leash check --policy FILE TOOL '{"arg": "value"}'` prints the decision
 the jail would make for that call and the reason (exit `0` allow, `1` deny).
-`--method resources/read` with a URI as TOOL checks another policed method;
-a method that is not policed is reported as relayed unchecked. Handy in CI:
+`--method resources/read` with a URI as TOOL checks another policed method,
+and `--method completion/complete` turns TOOL into the `ref` the proxy judges
+(a URI is a `ref/resource`, anything else a `ref/prompt`). `--params JSON`
+gives the call's whole `params` instead, judged by the same code as the
+proxy: a `ref` that is both kinds, or a `name` next to a `uri`, is denied
+here too. A method that is not policed is reported as relayed unchecked. Handy in CI:
 a test that `rm -rf /` stays denied after someone edits the policy.
 
 ## Performance

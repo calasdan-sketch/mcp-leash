@@ -399,7 +399,7 @@ def _compile_rule_set(spec, where: str = "arg_rules",
 # allowlist allows every tool.
 POLICY_KEYS = ("allow_tools", "deny_tools", "arg_rules", "policed_methods",
                "deny_methods", "strict_args", "audit_args", "hide_denied",
-               "tool_pins")
+               "tool_pins", "require_pins")
 # Notes: written by --init-policy and by `learn`, never read.
 NOTE_KEYS = ("_comment", "_not_called")
 RULE_KEYS = ("allow", "deny")  # the keys of one arg_rules.<tool> entry
@@ -598,6 +598,8 @@ def compile_policy(pol: dict) -> dict:
         raise ValueError("strict_args must be true or false")
     if not isinstance(pol.get("hide_denied", True), bool):
         raise ValueError("hide_denied must be true or false")
+    if not isinstance(pol.get("require_pins", False), bool):
+        raise ValueError("require_pins must be true or false")
     pol["_pins_by_norm"] = _compile_pins(pol.get("tool_pins"))
     pol["_compiled"] = True
     return pol
@@ -620,6 +622,28 @@ def tool_digest(tool: dict) -> str:
     data = json.dumps(body, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=True, allow_nan=False)
     return "sha256:" + hashlib.sha256(data.encode("ascii")).hexdigest()
+
+
+# Letters that look like Latin ones in common fonts (Cyrillic, Greek, a few
+# others), the digits 0 and 1, and '-' for '_'. Not the full Unicode
+# confusables table: enough to catch the usual look-alike tool names.
+_LOOKALIKE = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x",
+    "і": "i", "ј": "j", "ѕ": "s", "ԁ": "d", "ӏ": "l", "һ": "h", "ԛ": "q",
+    "ԝ": "w", "ɡ": "g", "ı": "i", "α": "a", "ο": "o", "ρ": "p", "ν": "v",
+    "ι": "i", "κ": "k", "ε": "e", "τ": "t", "ω": "w", "χ": "x", "υ": "u", "ѵ": "v", "ү": "y", "ɑ": "a",
+    "0": "o", "1": "l", "-": "_",
+})
+
+
+def name_skeleton(name: str) -> str:
+    """What a tool name looks like: normalised (see normalize_tool_name),
+    accents dropped, look-alike letters and digits mapped to one Latin
+    letter. Two different names with one skeleton are confusable."""
+    norm = normalize_tool_name(name)
+    bare = "".join(ch for ch in unicodedata.normalize("NFKD", norm)
+                   if not unicodedata.combining(ch))
+    return bare.translate(_LOOKALIKE)
 
 
 def _compile_pins(pins) -> dict:
@@ -809,6 +833,13 @@ def tool_visible(pol: dict, name) -> tuple[bool, str]:
         return False, f"tool '{name}' is denied by policy"
     if "*" not in allow and not _name_listed(norm, allow):
         return False, f"tool '{name}' is not in allow_tools"
+    if pol.get("require_pins"):
+        pins = pol.get("_pins_by_norm")
+        if pins is None:
+            pins = _compile_pins(pol.get("tool_pins"))
+        if norm not in pins:
+            return False, (f"tool '{name}' has no pin (require_pins: only "
+                           f"pinned tools are allowed)")
     return True, ""
 
 
@@ -908,6 +939,26 @@ def _tool_allowed(pol: dict, name, args) -> tuple[bool, str]:
     return True, ""
 
 
+def judge_call(pol: "dict | None", mkey: str, params) -> tuple:
+    """The policy's decision for one policed method call, as the proxy makes
+    it: (name, arguments, ok, reason). `mkey` is the normalised method.
+    Params that do not say unambiguously what the call is for are refused."""
+    params = params if isinstance(params, dict) else {}
+    targs = params.get("arguments")
+    if targs is None:
+        targs = {}
+    clash = _key_clash(params, _PARAM_KEYS)
+    if clash is not None:
+        return None, targs, False, "params: " + _clash_text(clash)
+    name, why = _selected(mkey, params)
+    if why is not None:
+        return name, targs, False, why
+    if pol is None:
+        return name, targs, True, ""
+    ok, reason = tool_allowed(pol, name, targs)
+    return name, targs, ok, reason
+
+
 def filter_tools_list(pol: dict, result) -> None:
     """hide_denied: drop tools denied by name from one tools/list page,
     in place. Keeps nextCursor and every other field. Entries that are
@@ -979,9 +1030,13 @@ def audit(event: dict) -> None:
         event["policy"] = _policy_digest
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        ledger.append(path, event, _open_private_append)
-    except OSError as e:
-        _say(f"mcp-leash: cannot write audit log {path}: {e}")
+        ledger.append(path, event, _open_private_append,
+                      warn=lambda note: _say(f"mcp-leash: audit log: {note}"))
+    except (OSError, ledger.KeyProblem) as e:
+        # loud, every time: the decision stands, its record does not
+        what = event.get("tool") or event.get("method") or "a message"
+        _say(f"mcp-leash: AUDIT RECORD NOT WRITTEN for {_printable(what, 80)} "
+             f"({event.get('decision')}) to {path}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1349,9 +1404,9 @@ def _spawn(server_cmd: list[str]):
     # the audit-log key is mcp-leash's alone: a server that had it could
     # forge a consistent chain over the records of its own calls
     env = None
-    if any(k.upper() == ledger.KEY_ENV for k in os.environ):
+    if any(k.upper() in ledger.SECRET_ENVS for k in os.environ):
         env = {k: v for k, v in os.environ.items()
-               if k.upper() != ledger.KEY_ENV}
+               if k.upper() not in ledger.SECRET_ENVS}
     try:
         proc = subprocess.Popen(
             [exe] + list(server_cmd[1:]), stdin=subprocess.PIPE,
@@ -1589,6 +1644,11 @@ class _Pending:
         self._count = 0
         self._heap: list = []           # (deadline, serial, key, entry)
         self._serial = itertools.count()
+        self._methods: collections.Counter = collections.Counter()
+
+    def owed(self, method: str) -> int:
+        """How many requests of this (normalised) method are unanswered."""
+        return self._methods[method]
 
     def add(self, req_id, method: str, deadline: float | None,
             call=None) -> None:
@@ -1597,6 +1657,7 @@ class _Pending:
                  "call": call, "gone": False}
         self._by_key.setdefault(key, collections.deque()).append(entry)
         self._count += 1
+        self._methods[method] += 1
         if deadline is not None:
             heapq.heappush(self._heap,
                            (deadline, next(self._serial), key, entry))
@@ -1629,6 +1690,7 @@ class _Pending:
             del self._by_key[key]
         entry["gone"] = True
         self._count -= 1
+        self._methods[entry["method"]] -= 1
         if len(self._heap) > 2 * self._count + 64:
             self._heap = [h for h in self._heap if not h[3]["gone"]]
             heapq.heapify(self._heap)
@@ -1662,6 +1724,7 @@ class _Pending:
         self._by_key.clear()
         self._heap = []
         self._count = 0
+        self._methods.clear()
         return out
 
     def next_deadline(self) -> float | None:
@@ -1734,6 +1797,10 @@ class _Proxy:
         # pinned tools whose definition this session saw change: normalised
         # name -> why; their calls are denied for the rest of the session
         self.drifted: dict[str, str] = {}
+        # pinned tools a tools/list of this session showed as pinned
+        self.verified: set[str] = set()
+        self._skeletons = {name_skeleton(n): n for n in
+                           ((pol or {}).get("_pins_by_norm") or {})}
         if stop is not None:
             stop.attach(self.q, proc)
 
@@ -1873,26 +1940,10 @@ class _Proxy:
             return
         if (mkey == "tools/call" if self.pol is None
                 else method_policed(self.pol, method)):
-            params = msg.get("params")
-            params = params if isinstance(params, dict) else {}
-            targs = params.get("arguments")
-            if targs is None:
-                targs = {}
-            clash = _key_clash(params, _PARAM_KEYS)
-            if clash is not None:
-                name, why = None, "params: " + _clash_text(clash)
-            else:
-                name, why = _selected(mkey, params)
-            if why is not None:
-                ok, reason = False, why
-            elif self.pol is None:
-                ok, reason = True, ""
-            else:
-                ok, reason = tool_allowed(self.pol, name, targs)
-                if ok and mkey == "tools/call" and self.drifted:
-                    drift = self.drifted.get(normalize_tool_name(name))
-                    if drift is not None:
-                        ok, reason = False, drift
+            name, targs, ok, reason = judge_call(self.pol, mkey,
+                                                 msg.get("params"))
+            if ok and self.pol is not None and mkey == "tools/call":
+                ok, reason = self._pin_gate(name)
             if self.pol is not None:
                 self._audit(name, targs, ok, reason, method)
             if not ok:
@@ -2065,6 +2116,33 @@ class _Proxy:
                     filter_tools_list(self.pol, result)
         return True
 
+    def _pin_gate(self, name) -> tuple[bool, str]:
+        """tools/call of a pinned tool: allowed only once a tools/list of
+        this session showed it with its pinned definition, never after one
+        showed it changed, and not while a tools/list is unanswered (its
+        answer may change what the tool is)."""
+        pins = self.pol.get("_pins_by_norm") or {}
+        norm = normalize_tool_name(name)
+        drift = self.drifted.get(norm)
+        if drift is not None:
+            return False, drift
+        if norm not in pins:
+            twin = self._skeletons.get(name_skeleton(name))
+            if twin is not None:
+                return False, (f"tool '{_printable(name, 100)}' looks like "
+                               f"the pinned tool '{_printable(twin, 100)}' "
+                               f"(a confusable name)")
+            return True, ""
+        if self.pending.owed("tools/list"):
+            return False, (f"tool '{_printable(name, 100)}' is pinned and a "
+                           f"tools/list is still unanswered: call it again "
+                           f"once the listing is in")
+        if norm not in self.verified:
+            return False, (f"tool '{_printable(name, 100)}' is pinned and no "
+                           f"tools/list in this session has shown its pinned "
+                           f"definition yet: list the tools first")
+        return True, ""
+
     def _check_pins(self, result, pins: dict) -> None:
         """tool_pins: take every pinned tool whose definition is not the one
         pinned out of this tools/list page, in place, and deny its calls for
@@ -2073,19 +2151,32 @@ class _Proxy:
         if not isinstance(result, dict) or not isinstance(
                 result.get("tools"), list):
             return
+        skeletons = self._skeletons
         kept = []
         for tool in result["tools"]:
             name = tool.get("name") if isinstance(tool, dict) else None
             norm = normalize_tool_name(name) if isinstance(name, str) else None
             pin = pins.get(norm) if norm else None
             if pin is None:
-                kept.append(tool)
+                twin = skeletons.get(name_skeleton(name)) if norm else None
+                if twin is None or norm in self.drifted:
+                    if norm not in self.drifted:
+                        kept.append(tool)
+                    continue
+                why = (f"tool '{_printable(name, 100)}' looks like the pinned "
+                       f"tool '{_printable(twin, 100)}' (a confusable name): "
+                       f"hidden and denied")
+                self.drifted[norm] = why
+                self._log(why)
+                audit({"tool": name, "method": "tools/list",
+                       "decision": "deny", "reason": why})
                 continue
             try:
                 seen = tool_digest(tool)
             except (TypeError, ValueError, RecursionError):
                 seen = "unhashable"
             if seen == pin and norm not in self.drifted:
+                self.verified.add(norm)
                 kept.append(tool)
                 continue
             if norm not in self.drifted:
@@ -2315,6 +2406,11 @@ def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
         return 2
     except (json.JSONDecodeError, re.error, ValueError) as e:
         _say(f"mcp-leash: bad policy: {e}")
+        return 2
+    try:
+        ledger.audit_key()      # a key that is set must be usable: say so now
+    except ledger.KeyProblem as e:
+        _say(f"mcp-leash: audit key: {e}")
         return 2
     global _policy_digest
     _policy_digest = policy_digest(policy_path)
@@ -2926,12 +3022,14 @@ def _write_atomic(path: str, text: str) -> None:
 
 
 def pin(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
-        dry_run: bool = False) -> int:
+        dry_run: bool = False, accept_changed: bool = False) -> int:
     """Start the server, list its tools, and write the SHA-256 of each tool
     the policy allows by name into the policy's tool_pins. A pin that
     changes is shown with the tool's new description first, so a re-pin is a
-    review and not a rubber stamp. Exit 0 done, 2 unusable policy, command
-    or session."""
+    review and not a rubber stamp: a changed pin is only replaced with
+    accept_changed (--accept-changed). Exit 0 done, 1 changed tools left
+    unaccepted (new pins are still written), 2 unusable policy, command or
+    session."""
     problem = _refuse_seconds(timeout=timeout)
     if problem:
         _say(f"mcp-leash pin: {problem}")
@@ -2987,7 +3085,8 @@ def pin(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
     old = raw.get("tool_pins") if isinstance(raw.get("tool_pins"), dict) else {}
     old_by_norm = {normalize_tool_name(k): k for k in old}
     new_pins = dict(old)
-    added, changed, same = [], [], 0
+    added, changed, refused, same = [], [], [], 0
+    skeletons = {name_skeleton(k): k for k in old}
     for norm, (name, d, tool) in sorted(listed.items()):
         if norm in twice:
             _say(f"pin: {name!r} is listed twice with different definitions; "
@@ -2995,12 +3094,21 @@ def pin(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
             continue
         key = old_by_norm.get(norm)
         if key is None:
+            twin = skeletons.get(name_skeleton(name))
+            if twin is not None:
+                _say(f"pin: warning: {name!r} looks like the pinned tool "
+                     f"{twin!r} (a confusable name); not pinned")
+                continue
             new_pins[name] = d
             added.append(name)
         elif old[key] != d:
-            new_pins[key] = d
-            changed.append(name)
-            _say(f"pin: CHANGED {name!r}: {_printable(tool.get('description', ''))}")
+            _say(f"pin: CHANGED {name!r}: "
+                 f"{_printable(tool.get('description', ''))}")
+            if accept_changed:
+                new_pins[key] = d
+                changed.append(name)
+            else:
+                refused.append(name)
         else:
             same += 1
     gone = sorted(k for n, k in old_by_norm.items() if n not in listed)
@@ -3009,10 +3117,16 @@ def pin(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
     for name in gone:
         _say(f"pin: {name!r} is pinned but the server no longer lists it "
              f"(pin kept)")
-    _say(f"pin: {len(added)} new, {len(changed)} changed, {same} unchanged"
+    if refused:
+        _say(f"pin: {len(refused)} changed tool(s) kept at their old pin "
+             f"(so still denied): review the descriptions above, then run "
+             f"again with --accept-changed")
+    _say(f"pin: {len(added)} new, {len(changed) + len(refused)} changed, "
+         f"{same} unchanged"
          + (" (dry run: policy not changed)" if dry_run else ""))
+    code = 1 if refused else 0
     if dry_run or (not added and not changed):
-        return 0
+        return code
     raw["tool_pins"] = new_pins
     try:
         compile_policy(copy.deepcopy(raw))
@@ -3025,7 +3139,7 @@ def pin(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
         _say(f"mcp-leash pin: cannot write {policy_path}: {e}")
         return 2
     _say(f"pin: wrote {policy_path}")
-    return 0
+    return code
 
 
 # ---------------------------------------------------------------------------
@@ -3057,15 +3171,43 @@ def policy_warnings(pol: dict) -> list[str]:
         warn.append("no tool_pins: a server that changes a tool's "
                     "description or schema (a rug pull) is not noticed; "
                     "`mcp-leash pin` records them")
+    pins = pol.get("_pins_by_norm") or {}
+    if pol.get("require_pins") and not pins:
+        warn.append("require_pins is on and nothing is pinned: every tool is "
+                    "denied")
+    if pins and not pol.get("require_pins") and allow_all and not deny_all:
+        warn.append("tools without a pin are allowed (allow_tools \"*\"); "
+                    "require_pins: true allows only pinned tools")
+    names = list(pins) + [normalize_tool_name(n) for n in (allow or [])
+                          if n != "*"]
+    seen_skel: dict[str, str] = {}
+    for n in dict.fromkeys(names):
+        other = seen_skel.setdefault(name_skeleton(n), n)
+        if other != n:
+            warn.append(f"{_printable(n, 80)!r} and {_printable(other, 80)!r}"
+                        f" are confusable names")
     if not pol.get("hide_denied", True):
         warn.append("hide_denied is false: the agent sees tools it cannot "
                     "call")
     return warn
 
 
+def _check_params(mkey: str, tool: str, args) -> dict:
+    """The params a client would send for this method and target: what
+    the proxy selects by (_SELECTORS), with `ref` built for
+    completion/complete (a URI is a ref/resource, anything else a
+    ref/prompt)."""
+    field = _SELECTORS.get(mkey, "name")
+    if field == "ref":
+        ref = ({"type": "ref/resource", "uri": tool} if "://" in tool
+               else {"type": "ref/prompt", "name": tool})
+        return {"ref": ref, "arguments": args}
+    return {field: tool, "arguments": args}
+
+
 def check(policy_path: str, tool: "str | None" = None,
           args_text: "str | None" = None,
-          method: str = "tools/call") -> int:
+          method: str = "tools/call", params_text: "str | None" = None) -> int:
     """Without a tool: load the policy, print a summary and any warnings
     (exit 0, or 2 when it would be refused at start-up). With one: print the
     decision the jail would make for that call (exit 0 allow, 1 deny)."""
@@ -3084,7 +3226,7 @@ def check(policy_path: str, tool: "str | None" = None,
     except (json.JSONDecodeError, re.error, ValueError) as e:
         _say(f"mcp-leash check: bad policy: {e}")
         return 2
-    if tool is None:
+    if tool is None and params_text is None:
         allow = pol.get("allow_tools")
         allowed = ("every tool" if allow is None or "*" in allow
                    else f"{len(allow)} tool(s)")
@@ -3096,23 +3238,37 @@ def check(policy_path: str, tool: "str | None" = None,
         for w in policy_warnings(pol):
             print(f"  warning: {w}")
         return 0
+    def parse(text, what):
+        try:
+            return json.loads(text, object_pairs_hook=_no_duplicate_keys,
+                              parse_constant=_no_constants), None
+        except (ValueError, RecursionError) as e:
+            return None, f"mcp-leash check: {what} is not valid JSON: {e}"
+
     args: object = {}
     if args_text is not None:
-        try:
-            args = json.loads(args_text, object_pairs_hook=_no_duplicate_keys,
-                              parse_constant=_no_constants)
-        except (ValueError, RecursionError) as e:
-            _say(f"mcp-leash check: arguments are not valid JSON: {e}")
+        args, why = parse(args_text, "arguments")
+        if why:
+            _say(why)
             return 2
+    mkey = normalize_tool_name(method)
+    if params_text is not None:
+        params, why = parse(params_text, "--params")
+        if why:
+            _say(why)
+            return 2
+    else:
+        params = _check_params(mkey, tool, args)
     if method_denied(pol, method):
-        ok, reason = False, f"method '{method}' is denied by policy"
+        name, ok, reason = tool, False, f"method '{method}' is denied by policy"
     elif not method_policed(pol, method):
         print(f"ALLOW {method}: not a policed method, relayed unchecked")
         return 0
     else:
-        ok, reason = tool_allowed(pol, tool, args)
+        name, _args, ok, reason = judge_call(pol, mkey, params)
+    shown = _printable(name if isinstance(name, str) else (tool or ""))
     if ok:
-        print(f"ALLOW {method} {_printable(tool)}")
+        print(f"ALLOW {method} {shown}")
         return 0
-    print(f"DENY  {method} {_printable(tool)}: {_printable(reason, 500)}")
+    print(f"DENY  {method} {shown}: {_printable(reason, 500)}")
     return 1

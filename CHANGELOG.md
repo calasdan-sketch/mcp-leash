@@ -7,7 +7,16 @@
 - **`mcp-leash check`.** Loads a policy without a server, summarises it and warns about weak settings; with a tool name and arguments, prints the decision and reason (exit 0 allow, 1 deny, 2 unusable).
 - `benchmarks/bench_overhead.py` measures the per-call overhead; README gives measured numbers (about 0.13 ms added at p50 on a 2-vCPU Linux VM).
 - README: one-line value, quick start, demo output, comparison table with sources, honest limits (stdio only, no content scanning).
-- Compatibility: existing policies load unchanged; `learn` output gains `tool_pins` only when it saw the tools listed. Audit records gain fields; `--audit` output is unchanged. `pin`, `check` and `verify-audit` are now subcommands, so a server command literally named one of them must come after `--` (as `learn` always did).
+- Panel review fixes (before release):
+  - Keyed logs: `verify-audit` with a key requires every record to be hmac-sha256 under that key, refuses unchained lines and an empty log, and names a record written with a different key; mcp-leash warns on stderr when appending to a log last written with another key or none.
+  - New `MCP_LEASH_AUDIT_KEY_FILE` (a 0600 file, read and never put in an environment) is the documented way to key the log; `MCP_LEASH_AUDIT_KEY` still works but is readable via `/proc/<pid>/environ`. A key file that others can read, empty or missing stops start-up (exit 2). Both variables are stripped from the server's environment. README states that a server running as the same user is not contained.
+  - Windows: the append lock is taken on a separate `audit.jsonl.lock`, so readers of the log are never blocked. A lock that cannot be had is an error: records are never written unlocked, and a record that cannot be written is reported on stderr as `AUDIT RECORD NOT WRITTEN`.
+  - An interrupted write no longer breaks the chain for good: the next append ends the incomplete line and writes a `recovered` record naming it, which `verify-audit` counts as recovered.
+  - Pinned tools are callable only after a `tools/list` in the session showed their pinned definition, and not while a `tools/list` is unanswered. New `require_pins: true` denies every tool without a pin. Names that look like a pinned tool (Cyrillic/Greek look-alikes, `0`/`1`, `-`/`_`, accents) are hidden and denied; `check` warns about look-alike names.
+  - `pin` keeps the old pin of a changed tool (exit 1) unless `--accept-changed` is given.
+  - `check` judges calls with the proxy's own code: `completion/complete` by its `ref`, and `--params JSON` for the whole params object.
+- **Breaking:** `pin`, `check` and `verify-audit` are now subcommands. A server command named one of them, given first (`mcp-leash check ...`), is read as the subcommand: put `--` before it (`mcp-leash --policy p.json -- check`), as client configs already do. Policies that `learn` writes now carry `tool_pins`, so a client must list tools before calling a pinned one (MCP clients do).
+- Compatibility otherwise: existing policies load unchanged. Audit records gain fields; `--audit` output is unchanged except for `note` lines for recovered writes.
 
 ## 0.7.0
 
