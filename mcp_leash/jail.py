@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import copy
 import difflib
 import fnmatch
+import hashlib
 import heapq
 import io
 import itertools
@@ -38,11 +40,13 @@ import stat
 import string
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
 
 from . import VERSION
+from . import ledger
 
 # The MCP revision learn offers in its initialize handshake. The server
 # answers with the revision it will speak; stdio has nowhere else to put
@@ -394,13 +398,14 @@ def _compile_rule_set(spec, where: str = "arg_rules",
 # `alow_tools` used to be skipped silently, and a policy that ignores its own
 # allowlist allows every tool.
 POLICY_KEYS = ("allow_tools", "deny_tools", "arg_rules", "policed_methods",
-               "deny_methods", "strict_args", "audit_args", "hide_denied")
+               "deny_methods", "strict_args", "audit_args", "hide_denied",
+               "tool_pins")
 # Notes: written by --init-policy and by `learn`, never read.
 NOTE_KEYS = ("_comment", "_not_called")
 RULE_KEYS = ("allow", "deny")  # the keys of one arg_rules.<tool> entry
 # compile_policy() marks the dict it has compiled with these; a policy
 # file must not be able to carry them (a forged marker skips validation).
-_INTERNAL_KEYS = ("_compiled", "_rules_by_norm")
+_INTERNAL_KEYS = ("_compiled", "_rules_by_norm", "_pins_by_norm")
 
 
 def _check_keys(obj: dict, allowed, where: str) -> None:
@@ -593,8 +598,51 @@ def compile_policy(pol: dict) -> dict:
         raise ValueError("strict_args must be true or false")
     if not isinstance(pol.get("hide_denied", True), bool):
         raise ValueError("hide_denied must be true or false")
+    pol["_pins_by_norm"] = _compile_pins(pol.get("tool_pins"))
     pol["_compiled"] = True
     return pol
+
+
+# ---------------------------------------------------------------------------
+# tool pins: a tool's definition, as the model reads it, fixed by its hash
+# ---------------------------------------------------------------------------
+
+_PIN = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
+
+
+def tool_digest(tool: dict) -> str:
+    """The pin of one tools/list entry: SHA-256 of its canonical JSON (keys
+    sorted, no whitespace, ASCII), every field but `_meta` - the name,
+    description, inputSchema, outputSchema, annotations and title are all
+    text the model reads or the client acts on. Key order and spacing do not
+    change the pin; any change to a description or schema does."""
+    body = {k: v for k, v in tool.items() if k != "_meta"}
+    data = json.dumps(body, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False)
+    return "sha256:" + hashlib.sha256(data.encode("ascii")).hexdigest()
+
+
+def _compile_pins(pins) -> dict:
+    """tool_pins: {"tool name": "sha256:<64 hex>"} -> {normalised name: pin}."""
+    if pins is None:
+        return {}
+    if not isinstance(pins, dict):
+        raise ValueError('tool_pins must be an object: {"tool name": '
+                         '"sha256:<64 hex digits>"}')
+    out: dict[str, str] = {}
+    for name, pin in pins.items():
+        norm = normalize_tool_name(name)
+        if not norm or "*" in norm:
+            raise ValueError(f"tool_pins: {name!r} is not a tool name (each "
+                             f"key names one tool; '*' is not a wildcard)")
+        if not isinstance(pin, str) or not _PIN.match(pin):
+            raise ValueError(f"tool_pins.{name}: must be \"sha256:\" and 64 "
+                             f"lowercase hex digits, got {_clip(pin, 80)}")
+        if norm in out:
+            raise ValueError(f"tool_pins: {name!r} is the same tool name as "
+                             f"another entry once normalised")
+        out[norm] = pin
+    return out
 
 
 def load_policy(path: str) -> dict:
@@ -613,6 +661,16 @@ def load_policy(path: str) -> dict:
             if key in pol:
                 raise ValueError(f"{key!r} is reserved for mcp-leash's own use")
     return compile_policy(pol)
+
+
+def policy_digest(path: str) -> "str | None":
+    """First 16 hex digits of the SHA-256 of the policy file's bytes: which
+    policy a session enforced, as recorded in the audit log."""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return None
 
 
 def default_policy() -> dict:
@@ -889,7 +947,7 @@ def audit_args_view(value, depth: int = 0):
 
 
 def _open_private_append(path: str):
-    """Append handle created 0600: the log can hold argument values.
+    """Binary append handle created 0600: the log can hold argument values.
     Best effort on Windows (mode bits beyond read-only do not exist
     there; the per-user profile directory is the protection)."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
@@ -902,19 +960,26 @@ def _open_private_append(path: str):
                 os.chmod(path, 0o600)
         except OSError:
             pass
-    return os.fdopen(fd, "a", encoding="utf-8")
+    return os.fdopen(fd, "ab")
+
+
+# Which policy was enforced: the first 16 hex digits of the SHA-256 of the
+# policy file's bytes, put in every record of the session (set by run()).
+_policy_digest: "str | None" = None
 
 
 def audit(event: dict) -> None:
-    """Append one JSON line to the audit log. An unwritable log is
-    reported on stderr but never takes the firewall down: the decision
-    has already been enforced."""
+    """Append one JSON line to the audit log, as the next link of its hash
+    chain (see ledger.py). An unwritable log is reported on stderr but never
+    takes the firewall down: the decision has already been enforced."""
     path = audit_log_path()
     event["at"] = int(time.time())
+    event["session"] = ledger.SESSION
+    if _policy_digest is not None:
+        event["policy"] = _policy_digest
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with _open_private_append(path) as f:
-            f.write(json.dumps(event) + "\n")
+        ledger.append(path, event, _open_private_append)
     except OSError as e:
         _say(f"mcp-leash: cannot write audit log {path}: {e}")
 
@@ -1281,10 +1346,16 @@ def _spawn(server_cmd: list[str]):
         err.fileno()
     except (io.UnsupportedOperation, AttributeError, OSError, ValueError):
         err = None
+    # the audit-log key is mcp-leash's alone: a server that had it could
+    # forge a consistent chain over the records of its own calls
+    env = None
+    if any(k.upper() == ledger.KEY_ENV for k in os.environ):
+        env = {k: v for k, v in os.environ.items()
+               if k.upper() != ledger.KEY_ENV}
     try:
         proc = subprocess.Popen(
             [exe] + list(server_cmd[1:]), stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=err)
+            stdout=subprocess.PIPE, stderr=err, env=env)
     except OSError as e:    # no #! line (Exec format error), permission, ...
         raise ServerNotFound(server_cmd[0], e.strerror or str(e)) from None
     assert proc.stdin and proc.stdout
@@ -1660,6 +1731,9 @@ class _Proxy:
         self.timed_out = 0
         # the signal that told the jail to stop, once one has
         self.signalled: "int | None" = None
+        # pinned tools whose definition this session saw change: normalised
+        # name -> why; their calls are denied for the rest of the session
+        self.drifted: dict[str, str] = {}
         if stop is not None:
             stop.attach(self.q, proc)
 
@@ -1815,6 +1889,10 @@ class _Proxy:
                 ok, reason = True, ""
             else:
                 ok, reason = tool_allowed(self.pol, name, targs)
+                if ok and mkey == "tools/call" and self.drifted:
+                    drift = self.drifted.get(normalize_tool_name(name))
+                    if drift is not None:
+                        ok, reason = False, drift
             if self.pol is not None:
                 self._audit(name, targs, ok, reason, method)
             if not ok:
@@ -1966,7 +2044,9 @@ class _Proxy:
         if entry["method"] == "tools/list" and "result" in msg:
             if self.observer is not None:
                 self.observer.on_tools(msg["result"])
-            if self.pol is not None and self.pol.get("hide_denied", True):
+            pins = (self.pol or {}).get("_pins_by_norm")
+            if self.pol is not None and (self.pol.get("hide_denied", True)
+                                         or pins):
                 result = msg["result"]
                 bad = (_key_clash(result, ("tools", "nextCursor"))
                        if isinstance(result, dict) else None)
@@ -1979,8 +2059,48 @@ class _Proxy:
                         f"bad response from server: {why}"))
                     self._audit_rejected("server", why, msg)
                     return False
-                filter_tools_list(self.pol, result)
+                if pins:
+                    self._check_pins(result, pins)
+                if self.pol.get("hide_denied", True):
+                    filter_tools_list(self.pol, result)
         return True
+
+    def _check_pins(self, result, pins: dict) -> None:
+        """tool_pins: take every pinned tool whose definition is not the one
+        pinned out of this tools/list page, in place, and deny its calls for
+        the rest of the session (a definition that changed once is not
+        trusted again because it changed back). Each change is audited once."""
+        if not isinstance(result, dict) or not isinstance(
+                result.get("tools"), list):
+            return
+        kept = []
+        for tool in result["tools"]:
+            name = tool.get("name") if isinstance(tool, dict) else None
+            norm = normalize_tool_name(name) if isinstance(name, str) else None
+            pin = pins.get(norm) if norm else None
+            if pin is None:
+                kept.append(tool)
+                continue
+            try:
+                seen = tool_digest(tool)
+            except (TypeError, ValueError, RecursionError):
+                seen = "unhashable"
+            if seen == pin and norm not in self.drifted:
+                kept.append(tool)
+                continue
+            if norm not in self.drifted:
+                # the name is the server's text, and goes to stderr: no
+                # control characters or bidi overrides reach the terminal
+                why = (f"tool '{_printable(name, 100)}' definition changed "
+                       f"since it was "
+                       f"pinned (pinned {pin[:19]}..., now {seen[:19]}...): "
+                       f"review it, then re-pin with `mcp-leash pin`")
+                self.drifted[norm] = why
+                self._log(why)
+                audit({"tool": name, "method": "tools/list",
+                       "decision": "deny", "reason": why,
+                       "pinned": pin, "seen": seen})
+        result["tools"] = kept
 
     # -- loop ---------------------------------------------------------------
 
@@ -2196,6 +2316,8 @@ def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
     except (json.JSONDecodeError, re.error, ValueError) as e:
         _say(f"mcp-leash: bad policy: {e}")
         return 2
+    global _policy_digest
+    _policy_digest = policy_digest(policy_path)
     client_in, client_out = stdin or sys.stdin, stdout or sys.stdout
     closed = _missing_streams(client_in, client_out)
     if closed:
@@ -2323,7 +2445,8 @@ def _unlearnable(called) -> dict[str, str]:
 
 
 def generate_policy(observed_tools: list[str],
-                    observed_calls: list[tuple[str, dict]]) -> dict:
+                    observed_calls: list[tuple[str, dict]],
+                    definitions: "dict[str, str] | None" = None) -> dict:
     """Build the tightest-fit allowlist policy from observations.
 
     Only tools that were actually CALLED (and answered) are allowed;
@@ -2372,6 +2495,13 @@ def generate_policy(observed_tools: list[str],
     not_called = sorted(listed - set(called) - set(left_out))
     if not_called:
         policy["_not_called"] = not_called  # listed by the server, denied
+    pins = {t: definitions[t] for t in called if t in (definitions or {})}
+    if pins:
+        policy["_comment"] += (" tool_pins: the SHA-256 of each allowed "
+                               "tool's definition as listed; a server that "
+                               "changes one (a rug pull) has that tool "
+                               "hidden and its calls denied until you "
+                               "re-pin (mcp-leash pin).")
     policy.update({
         "deny_tools": [],
         "arg_rules": arg_rules,
@@ -2381,6 +2511,8 @@ def generate_policy(observed_tools: list[str],
         "audit_args": "denied",
         "hide_denied": True,
     })
+    if pins:
+        policy["tool_pins"] = pins
     return policy
 
 
@@ -2392,6 +2524,8 @@ class _Recorder:
         self.tools: list[str] = []
         self.calls: list[tuple[str, dict]] = []
         self.protocol_version: str | None = None  # what the server answered
+        self.definitions: dict[str, str] = {}   # name -> tool_digest
+        self.changed: set[str] = set()   # listed twice, differently
 
     def on_call(self, name, args) -> None:
         if not isinstance(args, dict):
@@ -2403,6 +2537,14 @@ class _Recorder:
             for t in result["tools"]:
                 if isinstance(t, dict) and isinstance(t.get("name"), str):
                     self.tools.append(t["name"])
+                    try:
+                        d = tool_digest(t)
+                    except (TypeError, ValueError, RecursionError):
+                        continue
+                    old = self.definitions.get(t["name"])
+                    if old is not None and old != d:
+                        self.changed.add(t["name"])
+                    self.definitions[t["name"]] = d
 
 
 class _Session:
@@ -2523,6 +2665,24 @@ def _learn_from_script(proc, calls: list[dict], timeout: float,
 
 def _drive_script(session: _Session, calls: list[dict], timeout: float,
                   rec: _Recorder) -> str | None:
+    failure = _handshake(session, timeout, rec, "learn")
+    if failure is not None:
+        return failure
+    status = session.request({"jsonrpc": "2.0", "id": "learn-list",
+                              "method": "tools/list"}, timeout)
+    if status[0] == "ok":
+        rec.on_tools(status[1].get("result"))
+    elif status[0] == "timeout":
+        _say("learn: tools/list timed out")
+    else:
+        return "server closed before answering tools/list"
+    return _drive_calls(session, calls, timeout, rec)
+
+
+def _handshake(session: _Session, timeout: float, rec: _Recorder,
+               who: str) -> str | None:
+    """initialize + notifications/initialized, as an MCP client does. None
+    when done, else why not."""
     status = session.request(
         {"jsonrpc": "2.0", "id": "learn-init", "method": "initialize",
          "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {},
@@ -2542,22 +2702,18 @@ def _drive_script(session: _Session, calls: list[dict], timeout: float,
     if isinstance(version, str):
         rec.protocol_version = version
         if version != PROTOCOL_VERSION:
-            _say(f"learn: server speaks MCP {version} (offered "
+            _say(f"{who}: server speaks MCP {version} (offered "
                  f"{PROTOCOL_VERSION}); continuing with the server's version")
     # MCP: the client confirms the handshake before any other request;
     # an SDK server answers everything else with -32602 until it does.
     if not session.notify({"jsonrpc": "2.0",
                            "method": "notifications/initialized"}):
         return "server closed during the handshake"
-    status = session.request({"jsonrpc": "2.0", "id": "learn-list",
-                              "method": "tools/list"}, timeout)
-    if status[0] == "ok":
-        rec.on_tools(status[1].get("result"))
-    elif status[0] == "timeout":
-        _say("learn: tools/list timed out")
-    else:
-        return "server closed before answering tools/list"
+    return None
 
+
+def _drive_calls(session: _Session, calls: list[dict], timeout: float,
+                 rec: _Recorder) -> str | None:
     for i, call in enumerate(calls):
         name = call["tool"]
         args = call.get("arguments")
@@ -2656,7 +2812,13 @@ def learn(server_cmd: list[str], script: str | None = None,
                     failure = f"the server {proxy.lost} during the session"
         finally:
             _stop(proc)
-    policy = generate_policy(rec.tools, rec.calls)
+    # a tool whose definition changed during learning is not pinned: which
+    # one would be the right one is for a person to decide
+    for name in sorted(rec.changed):
+        _say(f"learn: {name!r} was listed with two different definitions; "
+             f"not pinned")
+    defs = {k: v for k, v in rec.definitions.items() if k not in rec.changed}
+    policy = generate_policy(rec.tools, rec.calls, defs)
     for name, why in _unlearnable(
             t for t, _ in rec.calls if isinstance(t, str)).items():
         _say(f"learn: left {name!r} out of the policy ({why}); "
@@ -2694,3 +2856,263 @@ def learn(server_cmd: list[str], script: str | None = None,
          f"call(s); allowlisted the {len(policy['allow_tools'])} "
          f"called{left}{spoke}")
     return code
+
+
+# ---------------------------------------------------------------------------
+# pin: record (or refresh) the tool_pins of an existing policy
+# ---------------------------------------------------------------------------
+
+MAX_LIST_PAGES = 100
+
+
+def _printable(value, limit: int = 300) -> str:
+    """One line of printable text for the terminal: a tool description is
+    the server's text, and may carry escapes or bidi overrides."""
+    text = value if isinstance(value, str) else json.dumps(value)
+    if len(text) > limit:
+        text = text[:limit] + "..."
+    return "".join(ch if ch.isprintable()
+                   else ch.encode("unicode_escape").decode("ascii")
+                   for ch in text)
+
+
+def _list_all_tools(session: _Session, timeout: float):
+    """Every tools/list page, following nextCursor. (tools, None) or
+    (None, why)."""
+    tools: list = []
+    cursor = None
+    for page in range(MAX_LIST_PAGES):
+        msg = {"jsonrpc": "2.0", "id": f"pin-list-{page}",
+               "method": "tools/list"}
+        if cursor is not None:
+            msg["params"] = {"cursor": cursor}
+        status = session.request(msg, timeout)
+        if status[0] != "ok":
+            return None, ("tools/list timed out" if status[0] == "timeout"
+                          else "server closed before answering tools/list")
+        result = status[1].get("result")
+        if not isinstance(result, dict) or not isinstance(
+                result.get("tools"), list):
+            return None, "tools/list did not return a list of tools"
+        tools.extend(result["tools"])
+        cursor = result.get("nextCursor")
+        if not isinstance(cursor, str) or not cursor:
+            return tools, None
+    return None, f"tools/list still had more pages after {MAX_LIST_PAGES}"
+
+
+def _write_atomic(path: str, text: str) -> None:
+    """Replace `path` with `text` all at once: a crash or a full disk leaves
+    the old file, never half of the new one. Keeps the file's mode."""
+    directory = os.path.dirname(os.path.abspath(path))
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        mode = 0o600
+    fd, tmp = tempfile.mkstemp(prefix=".mcp-leash-", suffix=".tmp",
+                               dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.name != "nt":
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def pin(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
+        dry_run: bool = False) -> int:
+    """Start the server, list its tools, and write the SHA-256 of each tool
+    the policy allows by name into the policy's tool_pins. A pin that
+    changes is shown with the tool's new description first, so a re-pin is a
+    review and not a rubber stamp. Exit 0 done, 2 unusable policy, command
+    or session."""
+    problem = _refuse_seconds(timeout=timeout)
+    if problem:
+        _say(f"mcp-leash pin: {problem}")
+        return 2
+    policy_path = expand_path(policy_path)
+    try:
+        with open(policy_path, encoding="utf-8") as f:
+            raw = json.load(f, object_pairs_hook=_no_duplicate_keys,
+                            parse_constant=_no_constants)
+        pol = compile_policy(copy.deepcopy(raw))
+    except FileNotFoundError:
+        _say(f"mcp-leash pin: no policy at {policy_path}")
+        return 2
+    except OSError as e:
+        _say(f"mcp-leash pin: cannot read the policy {policy_path}: {e}")
+        return 2
+    except (ValueError, re.error, RecursionError) as e:
+        _say(f"mcp-leash pin: bad policy: {e}")
+        return 2
+    try:
+        proc = _spawn(server_cmd)
+    except ServerNotFound as e:
+        _say(f"mcp-leash pin: {_server_problem(e)}")
+        return 2
+    session = _Session(proc)
+    try:
+        failure = _handshake(session, timeout, _Recorder(), "pin")
+        tools = None
+        if failure is None:
+            tools, failure = _list_all_tools(session, timeout)
+    finally:
+        session.close()
+        _stop(proc)
+    if failure is not None:
+        _say(f"mcp-leash pin: {failure}; policy not changed")
+        return 2
+    listed: dict[str, tuple[str, str, dict]] = {}   # norm -> (name, pin, tool)
+    twice: set[str] = set()
+    for tool in tools:
+        if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
+            continue
+        name = tool["name"]
+        if not tool_visible(pol, name)[0] or _star_inside(name):
+            continue
+        norm = normalize_tool_name(name)
+        try:
+            d = tool_digest(tool)
+        except (TypeError, ValueError, RecursionError):
+            continue
+        if norm in listed and listed[norm][1] != d:
+            twice.add(norm)
+        listed[norm] = (name, d, tool)
+    old = raw.get("tool_pins") if isinstance(raw.get("tool_pins"), dict) else {}
+    old_by_norm = {normalize_tool_name(k): k for k in old}
+    new_pins = dict(old)
+    added, changed, same = [], [], 0
+    for norm, (name, d, tool) in sorted(listed.items()):
+        if norm in twice:
+            _say(f"pin: {name!r} is listed twice with different definitions; "
+                 f"not pinned")
+            continue
+        key = old_by_norm.get(norm)
+        if key is None:
+            new_pins[name] = d
+            added.append(name)
+        elif old[key] != d:
+            new_pins[key] = d
+            changed.append(name)
+            _say(f"pin: CHANGED {name!r}: {_printable(tool.get('description', ''))}")
+        else:
+            same += 1
+    gone = sorted(k for n, k in old_by_norm.items() if n not in listed)
+    for name in added:
+        _say(f"pin: new {name!r}: {_printable(listed[normalize_tool_name(name)][2].get('description', ''))}")
+    for name in gone:
+        _say(f"pin: {name!r} is pinned but the server no longer lists it "
+             f"(pin kept)")
+    _say(f"pin: {len(added)} new, {len(changed)} changed, {same} unchanged"
+         + (" (dry run: policy not changed)" if dry_run else ""))
+    if dry_run or (not added and not changed):
+        return 0
+    raw["tool_pins"] = new_pins
+    try:
+        compile_policy(copy.deepcopy(raw))
+        _write_atomic(policy_path, json.dumps(raw, indent=2) + "\n")
+    except (ValueError, re.error) as e:
+        _say(f"mcp-leash pin: the pinned policy would not load ({e}); "
+             f"not written")
+        return 2
+    except OSError as e:
+        _say(f"mcp-leash pin: cannot write {policy_path}: {e}")
+        return 2
+    _say(f"pin: wrote {policy_path}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# check: what would the policy do? (dry run, no server)
+# ---------------------------------------------------------------------------
+
+
+def policy_warnings(pol: dict) -> list[str]:
+    """Settings that are legal but weaker than they look."""
+    warn = []
+    allow = pol.get("allow_tools")
+    allow_all = allow is None or "*" in allow
+    deny_all = "*" in (pol.get("deny_tools") or [])
+    if allow_all and not deny_all:
+        loose = [] if pol.get("strict_args") else ["any arguments"]
+        warn.append("allow_tools admits every tool the server offers, "
+                    "including ones added later"
+                    + (f" ({', '.join(loose)} unless arg_rules say "
+                       f"otherwise)" if loose else "")
+                    + "; `mcp-leash learn` writes a default-deny allowlist")
+    for tool, rules in (pol.get("_rules_by_norm") or {}).items():
+        if rules.get("allow") == "*" and not rules.get("deny"):
+            warn.append(f"arg_rules.{tool}: allow \"*\" with no deny rules "
+                        f"accepts any arguments")
+    if pol.get("audit_args") == "all":
+        warn.append("audit_args \"all\" writes the arguments of allowed calls "
+                    "(tokens, file contents, prompts) to the audit log")
+    if not pol.get("_pins_by_norm") and not deny_all:
+        warn.append("no tool_pins: a server that changes a tool's "
+                    "description or schema (a rug pull) is not noticed; "
+                    "`mcp-leash pin` records them")
+    if not pol.get("hide_denied", True):
+        warn.append("hide_denied is false: the agent sees tools it cannot "
+                    "call")
+    return warn
+
+
+def check(policy_path: str, tool: "str | None" = None,
+          args_text: "str | None" = None,
+          method: str = "tools/call") -> int:
+    """Without a tool: load the policy, print a summary and any warnings
+    (exit 0, or 2 when it would be refused at start-up). With one: print the
+    decision the jail would make for that call (exit 0 allow, 1 deny)."""
+    policy_path = expand_path(policy_path)
+    try:
+        pol = load_policy(policy_path)
+    except FileNotFoundError:
+        _say(f"mcp-leash check: no policy at {policy_path}")
+        return 2
+    except OSError as e:
+        _say(f"mcp-leash check: cannot read the policy {policy_path}: {e}")
+        return 2
+    except RecursionError:
+        _say("mcp-leash check: bad policy: nested too deeply")
+        return 2
+    except (json.JSONDecodeError, re.error, ValueError) as e:
+        _say(f"mcp-leash check: bad policy: {e}")
+        return 2
+    if tool is None:
+        allow = pol.get("allow_tools")
+        allowed = ("every tool" if allow is None or "*" in allow
+                   else f"{len(allow)} tool(s)")
+        print(f"policy OK: {policy_path}")
+        print(f"  allows {allowed}; denies {len(pol.get('deny_tools') or [])} "
+              f"by name; argument rules for {len(pol['_rules_by_norm'])}; "
+              f"{len(pol['_pins_by_norm'])} pinned; strict_args "
+              f"{'on' if pol.get('strict_args') else 'off'}")
+        for w in policy_warnings(pol):
+            print(f"  warning: {w}")
+        return 0
+    args: object = {}
+    if args_text is not None:
+        try:
+            args = json.loads(args_text, object_pairs_hook=_no_duplicate_keys,
+                              parse_constant=_no_constants)
+        except (ValueError, RecursionError) as e:
+            _say(f"mcp-leash check: arguments are not valid JSON: {e}")
+            return 2
+    if method_denied(pol, method):
+        ok, reason = False, f"method '{method}' is denied by policy"
+    elif not method_policed(pol, method):
+        print(f"ALLOW {method}: not a policed method, relayed unchecked")
+        return 0
+    else:
+        ok, reason = tool_allowed(pol, tool, args)
+    if ok:
+        print(f"ALLOW {method} {_printable(tool)}")
+        return 0
+    print(f"DENY  {method} {_printable(tool)}: {_printable(reason, 500)}")
+    return 1
