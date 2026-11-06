@@ -7,6 +7,9 @@ finds the problems; mcp-leash enforces least-privilege at runtime.
   mcp-leash --init-policy                # write an annotated starter policy
   mcp-leash --audit                      # show the audit log
   mcp-leash learn --script calls.json --out policy.json -- <server cmd>
+  mcp-leash pin --policy policy.json -- <server cmd>   # pin tool definitions
+  mcp-leash check --policy policy.json [TOOL [ARGS]]   # dry-run a decision
+  mcp-leash verify-audit                 # check the audit log's hash chain
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import sys
 
 from . import VERSION
 from . import jail as jail_mod
+from . import ledger
 
 
 # Tests patch this to exercise the Windows branch on any OS.
@@ -166,6 +170,9 @@ def cmd_audit(args) -> int:
         denies += denied
         mark = "DENY " if denied else "allow"
         what = e.get("tool")
+        if what is None and e.get("event") == "recovered":
+            print(f"note  audit log: {_plain(e.get('reason', ''))}")
+            continue
         if what is None:
             if e.get("rejected") is not None:  # a message the jail would not relay
                 what = f"{_plain(e['rejected'])} message"
@@ -213,12 +220,142 @@ def cmd_learn(argv: list[str]) -> int:
                           timeout=args.timeout, grace=args.grace)
 
 
+def _server_cmd(server: list[str]) -> list[str]:
+    cmd = list(server)
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    return cmd
+
+
+def cmd_pin(argv: list[str]) -> int:
+    default_policy = jail_mod.default_policy_path()
+    p = _Parser(
+        prog="mcp-leash pin",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Start the server, list its tools, and record the "
+                    "SHA-256 of each tool the policy allows in the policy's "
+                    "tool_pins. While mcp-leash runs, a pinned tool whose "
+                    "description or schema changes (a rug pull) is hidden "
+                    "and its calls are denied until you review it and pin "
+                    "again. Changed and new tools are shown with their "
+                    "description first.")
+    p.add_argument("--policy", default=default_policy, metavar="FILE",
+                   help=f"policy file to update (default: {default_policy})")
+    p.add_argument("--timeout", type=_seconds, default=30.0, metavar="SECS",
+                   help="seconds to wait for each server response "
+                        "(default: 30; 0 waits for ever)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="show what would change, write nothing")
+    p.add_argument("--accept-changed", action="store_true",
+                   help="replace the pins of tools whose definition changed "
+                        "(without it they keep their old pin, stay denied, "
+                        "and the exit status is 1)")
+    p.add_argument("server", nargs=argparse.REMAINDER,
+                   help="server command after -- ")
+    args = p.parse_args(argv)
+    cmd = _server_cmd(args.server)
+    if not cmd:
+        jail_mod._say("error: no server command: "
+                      "mcp-leash pin --policy p.json -- <cmd>")
+        return 2
+    return jail_mod.pin(args.policy, cmd, timeout=args.timeout,
+                        dry_run=args.dry_run,
+                        accept_changed=args.accept_changed)
+
+
+def cmd_check(argv: list[str]) -> int:
+    default_policy = jail_mod.default_policy_path()
+    p = _Parser(
+        prog="mcp-leash check",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Dry-run a policy, no server needed.\n\n"
+                    "  mcp-leash check --policy p.json\n"
+                    "      load it, summarise it, warn about weak settings "
+                    "(exit 0; 2 if mcp-leash would refuse it)\n"
+                    "  mcp-leash check --policy p.json run_cmd "
+                    "'{\"cmd\": \"rm -rf /\"}'\n"
+                    "      the decision for that call and why "
+                    "(exit 0 allow, 1 deny)")
+    p.add_argument("--policy", default=default_policy, metavar="FILE",
+                   help=f"policy file (default: {default_policy})")
+    p.add_argument("--method", default="tools/call",
+                   help="JSON-RPC method of the call (default: tools/call); "
+                        "for resources/read give the URI as TOOL; for "
+                        "completion/complete a URI or a prompt name, made "
+                        "into the ref the proxy judges")
+    p.add_argument("--params", metavar="JSON",
+                   help="the call's whole params object, judged exactly as "
+                        "the proxy judges it (instead of TOOL and ARGS)")
+    p.add_argument("tool", nargs="?", help="tool name (or URI)")
+    p.add_argument("arguments", nargs="?",
+                   help="the call's arguments as a JSON object "
+                        "(default: {})")
+    args = p.parse_args(argv)
+    return jail_mod.check(args.policy, args.tool, args.arguments,
+                          method=args.method, params_text=args.params)
+
+
+def cmd_verify_audit(argv: list[str]) -> int:
+    p = _Parser(
+        prog="mcp-leash verify-audit",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Check the audit log's hash chain: every record must "
+                    "match its hash and link to the one before it, so an "
+                    "edited, deleted, inserted or reordered record is found. "
+                    f"Records written with an audit key ({ledger.KEY_FILE_ENV}"
+                    f" or {ledger.KEY_ENV}) are HMAC-keyed and need the same "
+                    "key here; with a key, every record must be keyed. Prints the head "
+                    "(last seq and hash): keep a copy elsewhere to catch "
+                    "records cut off the end.\n\nexit status: 0 intact, "
+                    "1 broken (the first bad line is named), 2 no log")
+    p.add_argument("file", nargs="?",
+                   help="audit log (default: the one mcp-leash writes)")
+    p.add_argument("--anchor", metavar="HASH",
+                   help="a head hash noted earlier: the chain must still "
+                        "contain it (catches a log rewritten from scratch or "
+                        "cut back past it)")
+    args = p.parse_args(argv)
+    path = (jail_mod.expand_path(args.file) if args.file
+            else jail_mod.audit_log_path())
+    try:
+        rep = ledger.verify(path, ledger.audit_key(), anchor=args.anchor)
+    except ledger.KeyProblem as e:
+        jail_mod._say(f"mcp-leash verify-audit: audit key: {e}")
+        return 2
+    except FileNotFoundError:
+        jail_mod._say(f"mcp-leash verify-audit: no audit log at {path}")
+        return 2
+    except OSError as e:
+        jail_mod._say(f"mcp-leash verify-audit: cannot read {path}: {e}")
+        return 2
+    if not rep.ok:
+        where = f"line {rep.line_no}: " if rep.line_no else ""
+        print(f"BROKEN {path}: {where}{rep.problem}")
+        print(f"  {rep.records} record(s) before it verified")
+        return 1
+    legacy = (f"; {rep.legacy} older unchained line(s) at the start"
+              if rep.legacy else "")
+    recovered = (f"; {rep.recovered} interrupted write(s), marked recovered"
+                 if rep.recovered else "")
+    algs = "/".join(sorted(rep.algs)) or "none"
+    print(f"OK {path}: {rep.records} chained record(s) ({algs})"
+          f"{legacy}{recovered}")
+    if rep.torn_tail:
+        print(f"  note: the last line is incomplete ({rep.torn_tail} bytes: "
+              f"an interrupted write); the next record mcp-leash writes "
+              f"marks it recovered")
+    if rep.records:
+        print(f"  head: seq {rep.head_seq} {rep.head_hash}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     default_policy = jail_mod.default_policy_path()
     p = _Parser(
         prog="mcp-leash", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="subcommand: mcp-leash learn --help\n\n"
+        epilog="subcommands (each has --help): learn, pin, check, "
+               "verify-audit\n\n"
                "exit status: 0 a clean session; 2 an unusable policy or "
                "command; 3 the server failed (it exited or closed its pipes, "
                "stopped reading its input, or did not answer a request "
@@ -262,6 +399,12 @@ def build_parser() -> argparse.ArgumentParser:
 def _main(argv: list[str]) -> int:
     if argv[:1] == ["learn"]:
         return cmd_learn(argv[1:])
+    if argv[:1] == ["pin"]:
+        return cmd_pin(argv[1:])
+    if argv[:1] == ["check"]:
+        return cmd_check(argv[1:])
+    if argv[:1] == ["verify-audit"]:
+        return cmd_verify_audit(argv[1:])
     args = build_parser().parse_args(argv)
     if args.init_policy:
         return cmd_init_policy(args)
