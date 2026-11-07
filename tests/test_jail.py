@@ -2209,7 +2209,8 @@ class TestReadmeMatchesTheCli(ProxyCase):
 
     def test_every_option_the_help_lists_is_in_the_readme(self):
         readme = self.readme()
-        for argv in ([], ["learn"], ["pin"], ["check"], ["verify-audit"]):
+        for argv in ([], ["learn"], ["pin"], ["check"], ["test"], ["verify-audit"],
+                     ["rotate-audit"]):
             flags = self.options_in_help(argv) - {"--help"}
             self.assertGreaterEqual(len(flags), 1, (argv, flags))
             for flag in sorted(flags):

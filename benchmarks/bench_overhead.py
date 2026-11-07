@@ -51,6 +51,17 @@ POLICIES = {
             "pattern": r"\A(?!.*(?:^|[/\\])\.\.(?:[/\\]|$))/srv/data/[a-zA-Z0-9_.-]*\Z"}]}}},
         "strict_args": True,
     },
+    # the learned policy plus content scanning both ways (see bench_scan.py)
+    "scanned": {
+        "allow_tools": ["read_file"],
+        "arg_rules": {"read_file": {"allow": {"path": [{
+            "type": "string",
+            "pattern": r"\A(?!.*(?:^|[/\\])\.\.(?:[/\\]|$))/srv/data/[a-zA-Z0-9_.-]*\Z"}]}}},
+        "strict_args": True,
+        "scan": {"arguments": {"secrets": "deny", "pii": "deny"},
+                 "results": {"secrets": "redact", "pii": "redact",
+                             "injection": "deny", "hidden": "redact"}},
+    },
 }
 
 
@@ -89,6 +100,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--calls", type=int, default=2000)
     ap.add_argument("--policy", choices=sorted(POLICIES), default="learned")
+    ap.add_argument("--also", nargs="+", metavar="CMD",
+                    help="time another stdio proxy too: its command, up to "
+                         "the `--` before the server (it gets `-- python "
+                         "echo.py`)")
     args = ap.parse_args()
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with tempfile.TemporaryDirectory() as tmp:
@@ -104,6 +119,8 @@ def main() -> int:
         direct = run([sys.executable, server], args.calls, env)
         leashed = run([sys.executable, "-m", "mcp_leash", "--policy", policy,
                        "--", sys.executable, server], args.calls, env)
+        other = (run(args.also + ["--", sys.executable, server], args.calls, env)
+                 if args.also else None)
         audit = os.path.join(tmp, ".mcp-leash", "audit.jsonl")
         with open(audit, "rb") as f:
             records = sum(1 for _ in f)
@@ -111,7 +128,10 @@ def main() -> int:
           f"{platform.python_version()}, {args.calls} sequential calls, "
           f"policy '{args.policy}', {records} audit records written")
     print(f"{'':10}{'p50':>10}{'p90':>10}{'p99':>10}{'mean':>10}   (microseconds)")
-    for name, xs in (("direct", direct), ("mcp-leash", leashed)):
+    rows = [("direct", direct), ("mcp-leash", leashed)]
+    if other is not None:
+        rows.append((os.path.basename(args.also[-1])[:9], other))
+    for name, xs in rows:
         print(f"{name:10}{pct(xs, 50):10.0f}{pct(xs, 90):10.0f}"
               f"{pct(xs, 99):10.0f}{statistics.mean(xs):10.0f}")
     print(f"{'added':10}{pct(leashed, 50) - pct(direct, 50):10.0f}"

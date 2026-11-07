@@ -9,7 +9,9 @@ finds the problems; mcp-leash enforces least-privilege at runtime.
   mcp-leash learn --script calls.json --out policy.json -- <server cmd>
   mcp-leash pin --policy policy.json -- <server cmd>   # pin tool definitions
   mcp-leash check --policy policy.json [TOOL [ARGS]]   # dry-run a decision
+  mcp-leash test --policy p.json cases.json            # policy test cases
   mcp-leash verify-audit                 # check the audit log's hash chain
+  mcp-leash rotate-audit                 # start a new log file, chain intact
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import sys
 
 from . import VERSION
 from . import jail as jail_mod
+from . import httpup
 from . import ledger
 
 
@@ -166,9 +169,13 @@ def cmd_audit(args) -> int:
             continue
         if not isinstance(e, dict):
             continue
-        denied = e.get("decision") == "deny"
+        decision = e.get("decision")
+        denied = decision == "deny"
         denies += denied
-        mark = "DENY " if denied else "allow"
+        marks = {"deny": "DENY ", "would_deny": "WOULD", "redact": "REDACT",
+                 "would_redact": "WOULD", "flag": "FLAG "}
+        mark = marks.get(decision, "allow") if isinstance(decision, str) \
+            else "allow"
         what = e.get("tool")
         if what is None and e.get("event") == "recovered":
             print(f"note  audit log: {_plain(e.get('reason', ''))}")
@@ -204,17 +211,17 @@ def cmd_learn(argv: list[str]) -> int:
                    help="live mode: seconds to give the server to exit on "
                         "its own once stdin has ended, before it is sent "
                         "SIGTERM (default: 5; 0 stops it at once)")
+    _add_url_options(p)
     p.add_argument("server", nargs=argparse.REMAINDER,
                    help="server command after -- : "
                         "mcp-leash learn --script c.json -- <cmd>")
     args = p.parse_args(argv)
-    cmd = list(args.server)
-    if cmd and cmd[0] == "--":
-        cmd = cmd[1:]
+    cmd = _server_cmd(args.server)
+    cmd = _target(args, cmd)
     if not cmd:
         jail_mod._say("error: no server command: "
                       "mcp-leash learn [--script c.json] [--out p.json] "
-                      "-- <cmd>")
+                      "-- <cmd>  (or --url URL)")
         return 2
     return jail_mod.learn(cmd, script=args.script, out=args.out,
                           timeout=args.timeout, grace=args.grace)
@@ -225,6 +232,63 @@ def _server_cmd(server: list[str]) -> list[str]:
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     return cmd
+
+
+def _add_url_options(p) -> None:
+    p.add_argument("--url", metavar="URL",
+                   help="a remote MCP server (Streamable HTTP) instead of a "
+                        "command: mcp-leash speaks stdio to your client, "
+                        "HTTP to the server, and enforces the policy "
+                        "between them")
+    p.add_argument("--header", action="append", default=[],
+                   metavar="'Name: value'",
+                   help="send this header to --url (repeatable). The value "
+                        "is visible in the process list: for a credential "
+                        "use --header-env")
+    p.add_argument("--header-env", action="append", default=[],
+                   metavar="Name=ENVVAR",
+                   help="send header Name with the value of environment "
+                        "variable ENVVAR (e.g. Authorization=MY_TOKEN_HEADER "
+                        "where it holds 'Bearer ...')")
+    p.add_argument("--allow-insecure-http", action="store_true",
+                   help="allow a plain http:// --url that is not localhost")
+
+
+def _target(args, cmd: list[str]):
+    """The server to run: the command, or a remote one from --url. None
+    (after saying why) when the options cannot be used."""
+    if not args.url:
+        if args.header or args.header_env or args.allow_insecure_http:
+            jail_mod._say("error: --header, --header-env and "
+                          "--allow-insecure-http go with --url")
+            return None
+        return cmd or None
+    if cmd:
+        jail_mod._say("error: give a server command or --url, not both")
+        return None
+    headers = {}
+    try:
+        for text in args.header:
+            name, sep, value = text.partition(":")
+            if not sep:
+                raise httpup.UpstreamProblem(f"--header {text!r}: expected "
+                                             f"'Name: value'")
+            headers[name.strip()] = value.strip()
+        for text in args.header_env:
+            name, sep, var = text.partition("=")
+            if not sep or not var:
+                raise httpup.UpstreamProblem(f"--header-env {text!r}: "
+                                             f"expected Name=ENVVAR")
+            value = os.environ.get(var)
+            if not value:
+                raise httpup.UpstreamProblem(f"--header-env: environment "
+                                             f"variable {var} is not set")
+            headers[name.strip()] = value.strip()
+        return httpup.Target(args.url, headers, args.allow_insecure_http,
+                             timeout=args.timeout or None)
+    except httpup.UpstreamProblem as e:
+        jail_mod._say(f"error: {e}")
+        return None
 
 
 def cmd_pin(argv: list[str]) -> int:
@@ -250,13 +314,14 @@ def cmd_pin(argv: list[str]) -> int:
                    help="replace the pins of tools whose definition changed "
                         "(without it they keep their old pin, stay denied, "
                         "and the exit status is 1)")
+    _add_url_options(p)
     p.add_argument("server", nargs=argparse.REMAINDER,
                    help="server command after -- ")
     args = p.parse_args(argv)
-    cmd = _server_cmd(args.server)
+    cmd = _target(args, _server_cmd(args.server))
     if not cmd:
         jail_mod._say("error: no server command: "
-                      "mcp-leash pin --policy p.json -- <cmd>")
+                      "mcp-leash pin --policy p.json -- <cmd>  (or --url URL)")
         return 2
     return jail_mod.pin(args.policy, cmd, timeout=args.timeout,
                         dry_run=args.dry_run,
@@ -295,6 +360,26 @@ def cmd_check(argv: list[str]) -> int:
                           method=args.method, params_text=args.params)
 
 
+def cmd_test(argv: list[str]) -> int:
+    default_policy = jail_mod.default_policy_path()
+    p = _Parser(
+        prog="mcp-leash test",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Run a file of expected decisions against a policy, no "
+                    "server needed, with the proxy's own code. Each case is "
+                    "{\"tool\": ..., \"arguments\": {...}, \"expect\": "
+                    "\"allow\"|\"deny\", \"reason_contains\": ...} and/or "
+                    "{\"answer\": text, \"expect_answer\": "
+                    "\"clean\"|\"flag\"|\"redact\"|\"deny\"}. Keep the file "
+                    "next to the policy and run it in CI.\n\nexit status: 0 "
+                    "all passed, 1 some failed, 2 unusable policy or file")
+    p.add_argument("--policy", default=default_policy, metavar="FILE",
+                   help=f"policy file (default: {default_policy})")
+    p.add_argument("cases", help="JSON array of cases")
+    args = p.parse_args(argv)
+    return jail_mod.run_cases(args.policy, args.cases)
+
+
 def cmd_verify_audit(argv: list[str]) -> int:
     p = _Parser(
         prog="mcp-leash verify-audit",
@@ -310,6 +395,10 @@ def cmd_verify_audit(argv: list[str]) -> int:
                     "1 broken (the first bad line is named), 2 no log")
     p.add_argument("file", nargs="?",
                    help="audit log (default: the one mcp-leash writes)")
+    p.add_argument("--all", action="store_true",
+                   help="also check the rotated files beside the log, oldest "
+                        "first, and that each one carries on from the last "
+                        "(see rotate-audit)")
     p.add_argument("--anchor", metavar="HASH",
                    help="a head hash noted earlier: the chain must still "
                         "contain it (catches a log rewritten from scratch or "
@@ -318,6 +407,8 @@ def cmd_verify_audit(argv: list[str]) -> int:
     path = (jail_mod.expand_path(args.file) if args.file
             else jail_mod.audit_log_path())
     try:
+        if args.all:
+            return _verify_all(path, args.anchor)
         rep = ledger.verify(path, ledger.audit_key(), anchor=args.anchor)
     except ledger.KeyProblem as e:
         jail_mod._say(f"mcp-leash verify-audit: audit key: {e}")
@@ -344,8 +435,65 @@ def cmd_verify_audit(argv: list[str]) -> int:
         print(f"  note: the last line is incomplete ({rep.torn_tail} bytes: "
               f"an interrupted write); the next record mcp-leash writes "
               f"marks it recovered")
+    if rep.continues:
+        print(f"  note: this file begins after a rotation (it carries on from "
+              f"seq {rep.continues[1]} {rep.continues[0]}); check the older "
+              f"files with --all")
     if rep.records:
         print(f"  head: seq {rep.head_seq} {rep.head_hash}")
+    return 0
+
+
+def _verify_all(path: str, anchor) -> int:
+    files = ledger.segments(path)
+    if not files:
+        raise FileNotFoundError(path)
+    key = ledger.audit_key()
+    start, total = None, 0
+    for i, name in enumerate(files):
+        last = i == len(files) - 1
+        rep = ledger.verify(name, key, anchor=anchor if last else None,
+                            start=start)
+        if not rep.ok:
+            where = f"line {rep.line_no}: " if rep.line_no else ""
+            print(f"BROKEN {name}: {where}{rep.problem}")
+            return 1
+        if start is None and rep.continues:
+            print(f"  note: the oldest file kept, {os.path.basename(name)}, "
+                  f"begins after a rotation: older files are not here")
+        total += rep.records
+        if rep.records:
+            start = (rep.head_hash, rep.head_seq)
+    print(f"OK {len(files)} file(s), {total} chained record(s), one unbroken "
+          f"chain")
+    if start:
+        print(f"  head: seq {start[1]} {start[0]}")
+    return 0
+
+
+def cmd_rotate_audit(argv: list[str]) -> int:
+    p = _Parser(
+        prog="mcp-leash rotate-audit",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Move the audit log aside (audit.jsonl.<UTC stamp>) and "
+                    "start a new file whose first record carries on the hash "
+                    "chain, so the files together stay one verifiable chain "
+                    "(`verify-audit --all`). Nothing is ever deleted. The "
+                    "policy key audit_max_bytes does this by itself when the "
+                    "log reaches that size.\n\nexit status: 0 rotated, 1 "
+                    "nothing to rotate, 2 failed")
+    p.parse_args(argv)
+    path = jail_mod.audit_log_path()
+    try:
+        old = ledger.rotate_now(path, jail_mod._open_private_append)
+    except (OSError, ledger.KeyProblem) as e:
+        jail_mod._say(f"mcp-leash rotate-audit: {e}")
+        return 2
+    if old is None:
+        print("nothing to rotate (no log, an empty one, an older unchained "
+              "one, or one that cannot be moved right now)")
+        return 1
+    print(f"rotated: {old}\nnew log: {path}")
     return 0
 
 
@@ -354,8 +502,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = _Parser(
         prog="mcp-leash", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="subcommands (each has --help): learn, pin, check, "
-               "verify-audit\n\n"
+        epilog="subcommands (each has --help): learn, pin, check, test, "
+               "verify-audit, rotate-audit\n\n"
                "exit status: 0 a clean session; 2 an unusable policy or "
                "command; 3 the server failed (it exited or closed its pipes, "
                "stopped reading its input, or did not answer a request "
@@ -390,6 +538,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "request is answered; then it is sent SIGTERM, and "
                         "killed if it ignores that (default: 5; 0 stops it "
                         "at once)")
+    _add_url_options(p)
+    p.add_argument("--monitor", action="store_true",
+                   help="dry run on live traffic: judge every message and "
+                        "write the audit record, but block, hide and redact "
+                        "nothing (decisions read would_deny / would_redact). "
+                        "Use it to see what a new policy would break before "
+                        "you enforce it")
     p.add_argument("server", nargs=argparse.REMAINDER,
                    help="server command after -- : "
                         "mcp-leash --policy p.json -- npx -y srv")
@@ -403,22 +558,24 @@ def _main(argv: list[str]) -> int:
         return cmd_pin(argv[1:])
     if argv[:1] == ["check"]:
         return cmd_check(argv[1:])
+    if argv[:1] == ["test"]:
+        return cmd_test(argv[1:])
     if argv[:1] == ["verify-audit"]:
         return cmd_verify_audit(argv[1:])
+    if argv[:1] == ["rotate-audit"]:
+        return cmd_rotate_audit(argv[1:])
     args = build_parser().parse_args(argv)
     if args.init_policy:
         return cmd_init_policy(args)
     if args.audit:
         return cmd_audit(args)
-    cmd = list(args.server)
-    if cmd and cmd[0] == "--":
-        cmd = cmd[1:]
+    cmd = _target(args, _server_cmd(args.server))
     if not cmd:
         jail_mod._say("error: no server command: "
-                      "mcp-leash --policy p.json -- <cmd>")
+                      "mcp-leash --policy p.json -- <cmd>  (or --url URL)")
         return 2
     return jail_mod.run(args.policy, cmd, timeout=args.timeout,
-                        grace=args.grace)
+                        grace=args.grace, monitor=args.monitor)
 
 
 def main(argv=None) -> int:

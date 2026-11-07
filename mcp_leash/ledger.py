@@ -44,6 +44,10 @@ import stat
 import threading
 import time
 
+# Rotate the log once it is this many bytes (set from the policy's
+# audit_max_bytes by run()); None: never.
+MAX_BYTES: "int | None" = None
+
 KEY_ENV = "MCP_LEASH_AUDIT_KEY"
 KEY_FILE_ENV = "MCP_LEASH_AUDIT_KEY_FILE"
 SECRET_ENVS = (KEY_ENV, KEY_FILE_ENV)   # never passed to the server
@@ -141,13 +145,15 @@ def _seq_of(body: bytes):
 
 
 class _FileLock:
-    """Exclusive lock for the read-tail-then-append step. POSIX: flock on the
-    log itself. Windows: msvcrt locks a byte range, and a locked range of the
-    log could not be read by anyone meanwhile, so the lock is taken on a
-    separate `<log>.lock` file. Either way a lock that cannot be had within
-    _LOCK_WAIT seconds is an OSError: the record is not written unlocked."""
+    """Exclusive lock for the read-tail-then-append step (and for rotating
+    the log). It is taken on a separate `<log>.lock` file, never on the log
+    itself: the log can be renamed away while the lock is held, and on Windows
+    a locked range of the log could not be read by anyone meanwhile. POSIX:
+    flock; Windows: msvcrt on a byte range. Either way a lock that cannot be
+    had within _LOCK_WAIT seconds is an OSError: the record is not written
+    unlocked."""
 
-    def __init__(self, path: str, f):
+    def __init__(self, path: str, f=None):
         self.path, self.f = path, f
         self._release = None
 
@@ -157,12 +163,20 @@ class _FileLock:
         except ImportError:
             self._release = self._windows()
             return self
+        fd = os.open(self.path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            fcntl.flock(self.f.fileno(), fcntl.LOCK_EX)
+            fcntl.flock(fd, fcntl.LOCK_EX)
         except OSError as e:
+            os.close(fd)
             raise OSError(e.errno, f"cannot lock the audit log: "
                                    f"{e.strerror or e}") from None
-        self._release = lambda: fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
+
+        def release():
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        self._release = release
         return self
 
     def _windows(self):
@@ -263,41 +277,129 @@ def append(path: str, event: dict, opener, warn=None) -> None:
     OSError when the record cannot be written, KeyProblem for a bad key."""
     key = audit_key()
     alg = _alg(key)
-    with _lock, opener(path) as f, _FileLock(path, f):
-        st = os.fstat(f.fileno())
-        size, ident = st.st_size, (st.st_dev, st.st_ino)
-        cached = _cache.get(path)
-        out = b""
-        if cached is not None and cached[0] == (size, ident) and \
-                cached[1].startswith(alg + ":"):
-            prev, seq = cached[1], cached[2]
-        else:
-            notes: list = []
-            with open(path, "rb") as r:
-                prev, seq, partial = _state(r, size, alg, key, notes)
-            for note in notes:
-                if warn is not None and (path, note) not in _warned:
-                    _warned.add((path, note))
-                    warn(note)
-            if partial is not None:
-                rec = {"event": "recovered", "decision": "note",
-                       "reason": f"an interrupted write left an incomplete "
-                                 f"line ({len(partial)} bytes); it is kept "
-                                 f"as it is and named here",
-                       "damaged": digest(partial, alg, key),
-                       "at": int(time.time()), "session": SESSION,
-                       "seq": seq + 1, "prev": prev}
-                line, prev = _encode(rec, alg, key)
-                seq += 1
-                out = b"\n" + line
-        record = dict(event)
-        record["seq"] = seq + 1
-        record["prev"] = prev
-        line, h = _encode(record, alg, key)
-        out += line
-        f.write(out)
+    with _lock, _FileLock(path):
+        if MAX_BYTES:
+            _rotate_if_big(path, opener, MAX_BYTES, alg, key, warn)
+        with opener(path) as f:
+            _append_locked(path, f, event, alg, key, warn)
+
+
+def _append_locked(path: str, f, event: dict, alg: str, key, warn) -> None:
+    st = os.fstat(f.fileno())
+    size, ident = st.st_size, (st.st_dev, st.st_ino)
+    cached = _cache.get(path)
+    out = b""
+    if cached is not None and cached[0] == (size, ident) and \
+            cached[1].startswith(alg + ":"):
+        prev, seq = cached[1], cached[2]
+    else:
+        notes: list = []
+        with open(path, "rb") as r:
+            prev, seq, partial = _state(r, size, alg, key, notes)
+        for note in notes:
+            if warn is not None and (path, note) not in _warned:
+                _warned.add((path, note))
+                warn(note)
+        if partial is not None:
+            rec = {"event": "recovered", "decision": "note",
+                   "reason": f"an interrupted write left an incomplete "
+                             f"line ({len(partial)} bytes); it is kept "
+                             f"as it is and named here",
+                   "damaged": digest(partial, alg, key),
+                   "at": int(time.time()), "session": SESSION,
+                   "seq": seq + 1, "prev": prev}
+            line, prev = _encode(rec, alg, key)
+            seq += 1
+            out = b"\n" + line
+    record = dict(event)
+    record["seq"] = seq + 1
+    record["prev"] = prev
+    line, h = _encode(record, alg, key)
+    out += line
+    f.write(out)
+    f.flush()
+    _cache[path] = ((size + len(out), ident), h, seq + 1)
+
+
+# -- rotating ---------------------------------------------------------------
+
+
+def _segment_name(path: str) -> str:
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    name, n = f"{path}.{stamp}", 1
+    while os.path.exists(name):
+        n += 1
+        name = f"{path}.{stamp}-{n}"
+    return name
+
+
+def rotate(path: str, opener, alg: str, key, warn=None, force: bool = False,
+           limit: "int | None" = None) -> "str | None":
+    """Move the log aside and start the next file with a `rotated` record
+    that carries on the chain: its `prev` is the last hash of the old file
+    and its `seq` follows the old one, so the files together are one chain
+    (`verify-audit --all`). Called with the lock held. The name of the old
+    file, or None when there was nothing to rotate (or the log is too small,
+    unless `force`; or ends in an interrupted write, which the next append
+    marks first; or cannot be renamed, which on Windows happens while another
+    program has it open)."""
+    try:
+        size = os.stat(path).st_size
+    except FileNotFoundError:
+        return None
+    if size == 0 or (not force and size < (limit or 0)):
+        return None
+    notes: list = []
+    with open(path, "rb") as r:
+        prev, seq, partial = _state(r, size, alg, key, notes)
+    if partial is not None or seq == 0 or not prev.startswith(alg + ":"):
+        return None         # not a chain that can be carried on: leave it be
+    old = _segment_name(path)
+    try:
+        os.rename(path, old)
+    except OSError as e:
+        if warn is not None and ("rotate", path) not in _warned:
+            _warned.add(("rotate", path))
+            warn(f"cannot rotate the audit log: {e.strerror or e}")
+        return None
+    _cache.pop(path, None)
+    record = {"event": "rotated", "decision": "note",
+              "reason": f"the log continues {os.path.basename(old)}",
+              "continues": prev, "at": int(time.time()), "session": SESSION,
+              "seq": seq + 1, "prev": prev}
+    line, _h = _encode(record, alg, key)
+    with opener(path) as f:
+        f.write(line)
         f.flush()
-        _cache[path] = ((size + len(out), ident), h, seq + 1)
+    return old
+
+
+def _rotate_if_big(path, opener, limit, alg, key, warn) -> None:
+    rotate(path, opener, alg, key, warn, force=False, limit=limit)
+
+
+def rotate_now(path: str, opener) -> "str | None":
+    """`mcp-leash rotate-audit`: rotate whatever size the log is."""
+    key = audit_key()
+    with _lock, _FileLock(path):
+        return rotate(path, opener, _alg(key), key, force=True)
+
+
+def segments(path: str) -> list:
+    """The log's files in order, oldest first: the rotated ones (named
+    <log>.<UTC stamp>) and the live file last."""
+    base = os.path.basename(path)
+    folder = os.path.dirname(path) or "."
+    found = []
+    for name in os.listdir(folder):
+        if (name.startswith(base + ".") and not name.endswith(".lock")
+                and re.fullmatch(r"\d{8}T\d{6}Z(?:-\d+)?",
+                                 name[len(base) + 1:])):
+            found.append(name)
+    found.sort(key=lambda n: (n[len(base) + 1:].split("-")[0],
+                              int((n.split("-")[1:] or ["1"])[0])))
+    return [os.path.join(folder, n) for n in found] + (
+        [path] if os.path.exists(path) else [])
 
 
 # -- verifying --------------------------------------------------------------
@@ -312,6 +414,7 @@ class Report:
         self.head_seq = 0
         self.head_hash = ""
         self.algs: set = set()
+        self.continues: "tuple | None" = None   # starts after a rotation
         self.problem: "str | None" = None
         self.line_no: "int | None" = None
 
@@ -320,13 +423,21 @@ class Report:
         return self.problem is None
 
 
-def verify(path: str, key=None, anchor: "str | None" = None) -> Report:
+_HASH = re.compile(r"\A(?:sha256|hmac-sha256):[0-9a-f]{64}\Z")
+
+
+def verify(path: str, key=None, anchor: "str | None" = None,
+           start: "tuple | None" = None) -> Report:
     """Walk the log and check every link. Stops at the first problem.
 
     With `key`, the log must be keyed throughout: every record hmac-sha256
     under that key, no unchained lines (older records), and not empty.
     `anchor`: a hash printed by an earlier verify (a head you kept); the
-    chain must still contain it, or the log was rewritten or cut."""
+    chain must still contain it, or the log was rewritten or cut.
+    `start`: (hash, seq) of the last record of the file before this one in a
+    rotated log; this file's first record must follow it. Without it, a file
+    that begins with a `rotated` record is accepted as continuing an earlier
+    file (rep.continues says from which hash)."""
     rep = Report()
     strict = key is not None
     prev_hash: "str | None" = None   # hash of the last chained record
@@ -401,6 +512,15 @@ def verify(path: str, key=None, anchor: "str | None" = None) -> Report:
                     return rep
             if prev_hash is not None:
                 expect_prev, expect_seq = prev_hash, prev_seq + 1
+            elif start is not None:
+                expect_prev, expect_seq = start[0], start[1] + 1
+            elif (rec.get("event") == "rotated" and legacy_line is None
+                  and isinstance(rec.get("prev"), str)
+                  and _HASH.match(rec["prev"])
+                  and isinstance(rec.get("seq"), int)
+                  and not isinstance(rec["seq"], bool) and rec["seq"] > 1):
+                expect_prev, expect_seq = rec["prev"], rec["seq"]
+                rep.continues = (rec["prev"], rec["seq"] - 1)
             elif legacy_line is not None:     # the first record after legacy
                 expect_prev, expect_seq = digest(legacy_line, alg, key), 1
             else:

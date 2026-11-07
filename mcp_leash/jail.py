@@ -46,7 +46,9 @@ import time
 import unicodedata
 
 from . import VERSION
+from . import httpup
 from . import ledger
+from . import scan as scanmod
 
 # The MCP revision learn offers in its initialize handshake. The server
 # answers with the revision it will speak; stdio has nowhere else to put
@@ -399,13 +401,15 @@ def _compile_rule_set(spec, where: str = "arg_rules",
 # allowlist allows every tool.
 POLICY_KEYS = ("allow_tools", "deny_tools", "arg_rules", "policed_methods",
                "deny_methods", "strict_args", "audit_args", "hide_denied",
-               "tool_pins", "require_pins")
+               "tool_pins", "require_pins", "scan", "limits", "audit_redact",
+               "audit_max_bytes")
 # Notes: written by --init-policy and by `learn`, never read.
 NOTE_KEYS = ("_comment", "_not_called")
 RULE_KEYS = ("allow", "deny")  # the keys of one arg_rules.<tool> entry
 # compile_policy() marks the dict it has compiled with these; a policy
 # file must not be able to carry them (a forged marker skips validation).
-_INTERNAL_KEYS = ("_compiled", "_rules_by_norm", "_pins_by_norm")
+_INTERNAL_KEYS = ("_compiled", "_rules_by_norm", "_pins_by_norm", "_scan",
+                  "_limits")
 
 
 def _check_keys(obj: dict, allowed, where: str) -> None:
@@ -601,8 +605,115 @@ def compile_policy(pol: dict) -> dict:
     if not isinstance(pol.get("require_pins", False), bool):
         raise ValueError("require_pins must be true or false")
     pol["_pins_by_norm"] = _compile_pins(pol.get("tool_pins"))
+    if not isinstance(pol.get("audit_redact", True), bool):
+        raise ValueError("audit_redact must be true or false")
+    ceiling = pol.get("audit_max_bytes")
+    if ceiling is not None and (isinstance(ceiling, bool)
+                                or not isinstance(ceiling, int)
+                                or ceiling < 4096):
+        raise ValueError("audit_max_bytes must be a whole number of bytes, "
+                         "4096 or more")
+    pol["_scan"] = scanmod.compile_scan(pol.get("scan"))
+    pol["_limits"] = _compile_limits(pol.get("limits"))
     pol["_compiled"] = True
     return pol
+
+
+# ---------------------------------------------------------------------------
+# limits: how much a session may do
+# ---------------------------------------------------------------------------
+
+_LIMIT_KEYS = ("calls_per_minute", "max_calls", "max_result_bytes", "per_tool")
+_TOOL_LIMIT_KEYS = ("calls_per_minute", "max_calls")
+
+
+def _limit_number(obj: dict, key: str, where: str) -> None:
+    v = obj.get(key)
+    if v is not None and (isinstance(v, bool) or not isinstance(v, int)
+                          or v < 1):
+        raise ValueError(f"{where}.{key} must be a whole number, 1 or more")
+
+
+def _compile_limits(spec) -> dict:
+    """Validate the policy's `limits` block: per-session ceilings on calls
+    (a looping agent) and on the size of one answer (a flooded context)."""
+    if spec is None:
+        return {}
+    if not isinstance(spec, dict):
+        raise ValueError("limits must be an object")
+    _check_keys(spec, _LIMIT_KEYS + ("_comment",), "limits")
+    for key in _LIMIT_KEYS[:3]:
+        _limit_number(spec, key, "limits")
+    per_tool = spec.get("per_tool")
+    out = {k: spec[k] for k in _LIMIT_KEYS[:3] if k in spec}
+    out["per_tool"] = {}
+    if per_tool is not None:
+        if not isinstance(per_tool, dict):
+            raise ValueError("limits.per_tool must be an object keyed by "
+                             "tool name")
+        for tool, body in per_tool.items():
+            if not isinstance(body, dict):
+                raise ValueError(f"limits.per_tool.{tool} must be an object")
+            _check_keys(body, _TOOL_LIMIT_KEYS, f"limits.per_tool.{tool}")
+            for key in _TOOL_LIMIT_KEYS:
+                _limit_number(body, key, f"limits.per_tool.{tool}")
+            norm = normalize_tool_name(tool)
+            if norm in out["per_tool"] or "*" in norm:
+                raise ValueError(f"limits.per_tool: {tool!r} is a duplicate "
+                                 f"or a pattern (each key names one tool)")
+            out["per_tool"][norm] = dict(body)
+    return out
+
+
+class _Limiter:
+    """Counts what one session has done. A call that is denied does not
+    count; only a call that is about to be forwarded does."""
+
+    def __init__(self, limits: dict, clock=time.monotonic):
+        self.limits = limits
+        self.clock = clock
+        self.total = 0
+        self.stamps: collections.deque = collections.deque()
+        self.tool_total: collections.Counter = collections.Counter()
+        self.tool_stamps: dict = {}
+
+    @staticmethod
+    def _recent(stamps: collections.deque, now: float) -> int:
+        while stamps and stamps[0] <= now - 60.0:
+            stamps.popleft()
+        return len(stamps)
+
+    def admit(self, name) -> "str | None":
+        """None and the call is counted, or why it is over a limit."""
+        lim = self.limits
+        if not lim:
+            return None
+        norm = normalize_tool_name(name) if isinstance(name, str) else ""
+        tool = lim.get("per_tool", {}).get(norm, {})
+        now = self.clock()
+        checks = []
+        if "max_calls" in lim:
+            checks.append((self.total, lim["max_calls"],
+                           "calls this session"))
+        if "calls_per_minute" in lim:
+            checks.append((self._recent(self.stamps, now),
+                           lim["calls_per_minute"], "calls in a minute"))
+        if "max_calls" in tool:
+            checks.append((self.tool_total[norm], tool["max_calls"],
+                           f"calls of '{_printable(name, 60)}' this session"))
+        if "calls_per_minute" in tool:
+            st = self.tool_stamps.setdefault(norm, collections.deque())
+            checks.append((self._recent(st, now), tool["calls_per_minute"],
+                           f"calls of '{_printable(name, 60)}' in a minute"))
+        for used, ceiling, what in checks:
+            if used >= ceiling:
+                return f"rate limit: already {used} {what} (limit {ceiling})"
+        self.total += 1
+        self.stamps.append(now)
+        if tool:
+            self.tool_total[norm] += 1
+            self.tool_stamps.setdefault(norm, collections.deque()).append(now)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -979,21 +1090,28 @@ def filter_tools_list(pol: dict, result) -> None:
 # ---------------------------------------------------------------------------
 
 
-def audit_args_view(value, depth: int = 0):
+_LOG_KINDS = ("secrets", "pii")
+
+
+def audit_args_view(value, depth: int = 0, redact: bool = True):
     """Copy of call arguments fit for the log: every string cut to
     AUDIT_VALUE_MAX chars, nesting cut at the depth the policy denies
-    anyway. Secrets are still secrets - prefer audit_args 'denied'."""
+    anyway. Secrets and card numbers the scanner recognises are replaced
+    by a marker naming the rule (before the cut, so no half of one is left);
+    `redact` False (policy audit_redact: false) logs values as they are."""
     if depth > MAX_ARG_DEPTH:
         return "...(nested too deep)"
     if isinstance(value, str):
+        if redact:
+            value, _found = scanmod.redact_text(value, _LOG_KINDS)
         if len(value) <= AUDIT_VALUE_MAX:
             return value
         return value[:AUDIT_VALUE_MAX] + f"...(+{len(value) - AUDIT_VALUE_MAX})"
     if isinstance(value, dict):
-        return {str(k)[:AUDIT_VALUE_MAX]: audit_args_view(v, depth + 1)
+        return {str(k)[:AUDIT_VALUE_MAX]: audit_args_view(v, depth + 1, redact)
                 for k, v in value.items()}
     if isinstance(value, list):
-        return [audit_args_view(v, depth + 1) for v in value]
+        return [audit_args_view(v, depth + 1, redact) for v in value]
     return value
 
 
@@ -1078,7 +1196,7 @@ def _preview(line: bytes, limit: int = 200) -> str:
     return repr(text[:limit] + ("..." if len(text) > limit else ""))
 
 
-def _clip(value, limit: int = AUDIT_VALUE_MAX) -> str:
+def _clip(value, limit: int = AUDIT_VALUE_MAX, redact: bool = False) -> str:
     """A message (the wire line, or the parsed object) cut down for the
     audit record."""
     if isinstance(value, bytes):
@@ -1088,6 +1206,8 @@ def _clip(value, limit: int = AUDIT_VALUE_MAX) -> str:
             text = json.dumps(value)
         except (ValueError, RecursionError):
             text = f"<{type(value).__name__}>"
+    if redact:
+        text, _found = scanmod.redact_text(text, _LOG_KINDS)
     if len(text) <= limit:
         return text
     return text[:limit] + f"...(+{len(text) - limit})"
@@ -1387,7 +1507,9 @@ def _server_problem(e: ServerNotFound) -> str:
     return f"server command not found or not executable: {e}"
 
 
-def _spawn(server_cmd: list[str]):
+def _spawn(server_cmd):
+    if isinstance(server_cmd, httpup.Target):
+        return server_cmd.open()        # a remote server: see httpup.py
     # Resolve the executable ourselves: a clean error instead of a
     # FileNotFoundError traceback, and on Windows `npx` is `npx.cmd`,
     # which only PATHEXT-aware lookup (shutil.which) finds.
@@ -1651,10 +1773,10 @@ class _Pending:
         return self._methods[method]
 
     def add(self, req_id, method: str, deadline: float | None,
-            call=None) -> None:
+            call=None, name=None) -> None:
         key = _id_key(req_id)
         entry = {"id": req_id, "method": method, "deadline": deadline,
-                 "call": call, "gone": False}
+                 "call": call, "name": name, "gone": False}
         self._by_key.setdefault(key, collections.deque()).append(entry)
         self._count += 1
         self._methods[method] += 1
@@ -1775,8 +1897,16 @@ class _Proxy:
 
     def __init__(self, proc, client_in, client_out, timeout: float | None,
                  pol: dict | None, observer=None, grace: float = DEFAULT_GRACE,
-                 stop: "_StopSignals | None" = None):
+                 stop: "_StopSignals | None" = None, monitor: bool = False):
         self.proc = proc
+        # monitor: decide and record as ever, but let everything through
+        # (a dry run against live traffic: decisions read "would_deny")
+        self.monitor = monitor
+        self.limiter = _Limiter((pol or {}).get("_limits") or {})
+        self._scan = (pol or {}).get("_scan") or {}
+        # tools whose description the scanner took out: name -> why
+        self.poisoned: dict[str, str] = {}
+        self._flagged: set = set()
         self.grace = grace
         self.q: "queue.SimpleQueue" = queue.SimpleQueue()
         self.client = _Writer(client_out)
@@ -1835,15 +1965,20 @@ class _Proxy:
         return True
 
     def _audit(self, name, args, ok: bool, reason: str,
-               method: str = "tools/call") -> None:
-        event = {"decision": "allow" if ok else "deny", "reason": reason}
+               method: str = "tools/call", decision: "str | None" = None,
+               extra: "dict | None" = None) -> None:
+        event = {"decision": decision or ("allow" if ok else "deny"),
+                 "reason": reason}
+        if extra:
+            event.update(extra)
         if name is not None:  # None: nothing in params said what it was for
             event["tool"] = name if isinstance(name, str) else repr(name)
         if method != "tools/call" or name is None:
             event["method"] = method
         mode = self.pol.get("audit_args", "denied")
-        if mode == "all" or (mode == "denied" and not ok):
-            event["args"] = audit_args_view(args)
+        if mode == "all" or (mode == "denied" and not ok):  # also would_deny
+            event["args"] = audit_args_view(
+                args, redact=self.pol.get("audit_redact", True))
         audit(event)
 
     # -- client -> server ---------------------------------------------------
@@ -1857,7 +1992,8 @@ class _Proxy:
             event["method"] = method
         mode = (self.pol or {}).get("audit_args", "denied")
         if subject is not None and mode != "none":
-            event["message"] = _clip(subject)
+            event["message"] = _clip(
+                subject, redact=(self.pol or {}).get("audit_redact", True))
         audit(event)
 
     def _refuse(self, why: str, code: int = INVALID_REQUEST, req_id=None,
@@ -1931,21 +2067,40 @@ class _Proxy:
         # the method as a parser that ignores case would route it: what the
         # rest of the proxy goes by (tools/list responses, learn's observer)
         mkey = normalize_tool_name(method)
+        pname = None
         if self.pol is not None and method_denied(self.pol, method):
             reason = f"method '{method}' is denied by policy"
-            audit({"method": method, "decision": "deny", "reason": reason})
-            if has_id:
-                self.client.send(_rpc_error(req_id, METHOD_NOT_FOUND,
-                                            f"mcp-leash denied: {reason}"))
-            return
+            if self.monitor:
+                audit({"method": method, "decision": "would_deny",
+                       "reason": reason})
+            else:
+                audit({"method": method, "decision": "deny",
+                       "reason": reason})
+                if has_id:
+                    self.client.send(_rpc_error(req_id, METHOD_NOT_FOUND,
+                                                f"mcp-leash denied: {reason}"))
+                return
         if (mkey == "tools/call" if self.pol is None
                 else method_policed(self.pol, method)):
             name, targs, ok, reason = judge_call(self.pol, mkey,
                                                  msg.get("params"))
+            pname = name if isinstance(name, str) else None
+            extra = None
             if ok and self.pol is not None and mkey == "tools/call":
                 ok, reason = self._pin_gate(name)
+            if ok and self._scan.get("arguments"):
+                ok, reason, extra = self._scan_arguments(targs)
+            if ok and self.pol is not None:
+                why = self.limiter.admit(name)
+                if why is not None:
+                    ok, reason = False, why
             if self.pol is not None:
-                self._audit(name, targs, ok, reason, method)
+                if not ok and self.monitor:
+                    self._audit(name, targs, False, reason, method,
+                                decision="would_deny", extra=extra)
+                    ok = True
+                else:
+                    self._audit(name, targs, ok, reason, method, extra=extra)
             if not ok:
                 # Same id, same type, as the request. A notification
                 # (no id) never gets a response — it is just dropped.
@@ -1965,7 +2120,8 @@ class _Proxy:
         if not self._forward(msg, req_id, has_id):
             return
         if has_id:
-            self.pending.add(req_id, mkey, self._deadline(), call=call)
+            self.pending.add(req_id, mkey, self._deadline(), call=call,
+                             name=pname)
             self._cancelled.discard(_id_key(req_id))    # the id is in use again
         elif mkey == "notifications/cancelled":
             self._stop_waiting_for(msg)
@@ -1997,7 +2153,127 @@ class _Proxy:
         if rid is not _NO_ID and self.pending.pop(rid) is not None:
             self._cancelled.add(_id_key(rid))
 
+    def _scan_arguments(self, targs):
+        """scan.arguments: (ok, reason, audit fields). A detector set to
+        "deny" refuses the call; one set to "flag" only leaves a note on the
+        call's audit record. Nothing found is the common case and costs one
+        pass over the strings."""
+        rules = self._scan["arguments"]
+        rep = scanmod.Report()
+        scanmod.scan_value(targs, tuple(rules), rep)
+        if not rep:
+            return True, "", None
+        extra = {"scan": rep.listing()}
+        if any(rules[k] == "deny" for k in rep.kinds()):
+            return False, (f"arguments contain {rep.summary()} "
+                           f"(scan.arguments)"), extra
+        return True, "", extra
+
     # -- server -> client ---------------------------------------------------
+
+    def _block_result(self, entry: dict, why: str, found=None) -> bool:
+        """An answer the jail will not pass on: the request fails under its
+        own id (monitor mode: noted, and passed on). Returns whether the
+        answer should still be delivered."""
+        event = {"decision": "would_deny" if self.monitor else "deny",
+                 "reason": why, "method": entry["method"], "answer": True}
+        if entry.get("name") is not None:
+            event["tool"] = entry["name"]
+        if found:
+            event["scan"] = found
+        audit(event)
+        if self.monitor:
+            return True
+        self.client.send(_rpc_error(entry["id"], INTERNAL_ERROR,
+                                    f"mcp-leash blocked the result: {why}"))
+        return False
+
+    def _scan_result(self, msg: dict, entry: dict) -> bool:
+        """limits.max_result_bytes and scan.results on the answer to a
+        policed request. False: the answer was replaced by an error."""
+        ceiling = (self.pol.get("_limits") or {}).get("max_result_bytes")
+        if ceiling:
+            try:
+                size = len(_encode(msg))
+            except (RecursionError, ValueError):
+                size = ceiling + 1
+            if size > ceiling:
+                return self._block_result(
+                    entry, f"answer is {size} bytes, over limits."
+                           f"max_result_bytes ({ceiling})")
+        rules = self._scan.get("results")
+        if not rules:
+            return True
+        field = "result" if "result" in msg else "error"
+        rep = scanmod.Report()
+        scanmod.scan_value(msg[field], tuple(rules), rep)
+        if not rep:
+            return True
+        found = rep.listing()
+        if any(rules[k] == "deny" for k in rep.kinds()):
+            return self._block_result(
+                entry, f"answer contains {rep.summary()} (scan.results)",
+                found)
+        event = {"method": entry["method"], "scan": found}
+        if entry.get("name") is not None:
+            event["tool"] = entry["name"]
+        redact = tuple(k for k in rep.kinds() if rules[k] == "redact")
+        if redact:
+            if not self.monitor:
+                msg[field] = scanmod.scan_value(msg[field], redact,
+                                                scanmod.Report(), redact=True)
+            event.update(decision="would_redact" if self.monitor else "redact",
+                         reason=f"answer contained {rep.summary()}; "
+                                f"redacted (scan.results)"
+                         if not self.monitor else
+                         f"answer contains {rep.summary()} (scan.results)")
+        else:
+            event.update(decision="flag", reason=f"answer contains "
+                         f"{rep.summary()} (scan.results)")
+        audit(event)
+        return True
+
+    def _check_descriptions(self, result) -> None:
+        """scan.descriptions: a tool whose description (or schema text)
+        carries instructions or hidden characters is taken out of this page
+        and its calls are denied, or just noted once ("flag")."""
+        rules = self._scan["descriptions"]
+        if not isinstance(result, dict) or not isinstance(
+                result.get("tools"), list):
+            return
+        kept = []
+        for tool in result["tools"]:
+            name = tool.get("name") if isinstance(tool, dict) else None
+            if not isinstance(tool, dict) or not isinstance(name, str):
+                kept.append(tool)
+                continue
+            rep = scanmod.Report()
+            scanmod.scan_value({k: v for k, v in tool.items() if k != "name"},
+                               tuple(rules), rep)
+            norm = normalize_tool_name(name)
+            if not rep:
+                if norm not in self.poisoned:
+                    kept.append(tool)
+                continue
+            hide = any(rules[k] == "hide" for k in rep.kinds())
+            why = (f"tool '{_printable(name, 100)}' description contains "
+                   f"{rep.summary()} (scan.descriptions)")
+            if norm not in self.poisoned and norm not in self._flagged:
+                self._log(why + (": hidden and denied" if hide else ""))
+                audit({"tool": name, "method": "tools/list",
+                       "decision": ("would_deny" if self.monitor else "deny")
+                       if hide else "flag", "reason": why,
+                       "scan": rep.listing()})
+            if hide:
+                self.poisoned.setdefault(norm, why)
+            else:
+                self._flagged.add(norm)
+                kept.append(tool)
+                continue
+            if norm in self.poisoned and not self.monitor:
+                continue
+            kept.append(tool)
+        result["tools"] = kept
 
     def _refuse_server(self, why: str, rid=_NO_ID, subject=None) -> None:
         """A message from the server the jail will not relay. When it
@@ -2092,12 +2368,17 @@ class _Proxy:
         if entry["method"] == "tools/call" and entry.get("call") is not None:
             if self.observer is not None and _call_succeeded(msg):
                 self.observer.on_call(*entry["call"])
+        if (self.pol is not None and entry["method"] != "tools/list"
+                and method_policed(self.pol, entry["method"])
+                and not self._scan_result(msg, entry)):
+            return False
         if entry["method"] == "tools/list" and "result" in msg:
             if self.observer is not None:
                 self.observer.on_tools(msg["result"])
             pins = (self.pol or {}).get("_pins_by_norm")
             if self.pol is not None and (self.pol.get("hide_denied", True)
-                                         or pins):
+                                         or pins or self._scan.get(
+                                             "descriptions")):
                 result = msg["result"]
                 bad = (_key_clash(result, ("tools", "nextCursor"))
                        if isinstance(result, dict) else None)
@@ -2110,9 +2391,14 @@ class _Proxy:
                         f"bad response from server: {why}"))
                     self._audit_rejected("server", why, msg)
                     return False
+                # monitor mode: judged on a copy, the listing goes out whole
+                view = dict(result) if (self.monitor and isinstance(
+                    result, dict)) else result
                 if pins:
-                    self._check_pins(result, pins)
-                if self.pol.get("hide_denied", True):
+                    self._check_pins(view, pins)
+                if self._scan.get("descriptions"):
+                    self._check_descriptions(view)
+                if self.pol.get("hide_denied", True) and not self.monitor:
                     filter_tools_list(self.pol, result)
         return True
 
@@ -2123,6 +2409,14 @@ class _Proxy:
         answer may change what the tool is)."""
         pins = self.pol.get("_pins_by_norm") or {}
         norm = normalize_tool_name(name)
+        bad = self.poisoned.get(norm)
+        if bad is not None:
+            return False, bad
+        if (self._scan.get("descriptions") and self.pending.owed("tools/list")):
+            return False, (f"tool '{_printable(name, 100)}' cannot be called "
+                           f"while a tools/list is unanswered (scan.descriptions "
+                           f"checks its answer): call it again once the listing "
+                           f"is in")
         drift = self.drifted.get(norm)
         if drift is not None:
             return False, drift
@@ -2169,7 +2463,8 @@ class _Proxy:
                 self.drifted[norm] = why
                 self._log(why)
                 audit({"tool": name, "method": "tools/list",
-                       "decision": "deny", "reason": why})
+                       "decision": "would_deny" if self.monitor else "deny",
+                       "reason": why})
                 continue
             try:
                 seen = tool_digest(tool)
@@ -2189,8 +2484,8 @@ class _Proxy:
                 self.drifted[norm] = why
                 self._log(why)
                 audit({"tool": name, "method": "tools/list",
-                       "decision": "deny", "reason": why,
-                       "pinned": pin, "seen": seen})
+                       "decision": "would_deny" if self.monitor else "deny",
+                       "reason": why, "pinned": pin, "seen": seen})
         result["tools"] = kept
 
     # -- loop ---------------------------------------------------------------
@@ -2380,7 +2675,8 @@ class _Proxy:
 
 
 def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
-        stdin=None, stdout=None, grace: float = DEFAULT_GRACE) -> int:
+        stdin=None, stdout=None, grace: float = DEFAULT_GRACE,
+        monitor: bool = False) -> int:
     """Run the jail: policy-check stdin -> server, pass server -> stdout.
 
     `stdin`/`stdout` default to the process's own (binary) streams; tests
@@ -2414,6 +2710,7 @@ def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
         return 2
     global _policy_digest
     _policy_digest = policy_digest(policy_path)
+    ledger.MAX_BYTES = pol.get("audit_max_bytes")
     client_in, client_out = stdin or sys.stdin, stdout or sys.stdout
     closed = _missing_streams(client_in, client_out)
     if closed:
@@ -2426,8 +2723,11 @@ def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
             _say(f"mcp-leash: {_server_problem(e)}")
             return 2
         try:
+            if monitor:
+                _say("mcp-leash: MONITOR MODE: nothing is blocked; decisions "
+                     "are recorded as would_deny / would_redact")
             return _Proxy(proc, client_in, client_out, timeout, pol,
-                          grace=grace, stop=stop).serve()
+                          grace=grace, stop=stop, monitor=monitor).serve()
         finally:
             _stop(proc)
 
@@ -3205,6 +3505,132 @@ def _check_params(mkey: str, tool: str, args) -> dict:
     return {field: tool, "arguments": args}
 
 
+def decide_call(pol: dict, mkey: str, params) -> tuple:
+    """(name, ok, reason) for one policed call: the policy's tool and
+    argument rules, then scan.arguments. What `check` and `test` print; the
+    proxy additionally applies pins, limits and the session's state."""
+    name, targs, ok, reason = judge_call(pol, mkey, params)
+    rules = (pol.get("_scan") or {}).get("arguments")
+    if ok and rules:
+        rep = scanmod.Report()
+        scanmod.scan_value(targs, tuple(rules), rep)
+        if rep and any(rules[k] == "deny" for k in rep.kinds()):
+            return name, False, f"arguments contain {rep.summary()} (scan.arguments)"
+    return name, ok, reason
+
+
+def judge_answer(pol: dict, text) -> tuple:
+    """What scan.results does to an answer: ("clean" | "flag" | "redact" |
+    "deny", the answer after redaction)."""
+    rules = (pol.get("_scan") or {}).get("results")
+    if not rules:
+        return "clean", text
+    rep = scanmod.Report()
+    scanmod.scan_value(text, tuple(rules), rep)
+    if not rep:
+        return "clean", text
+    if any(rules[k] == "deny" for k in rep.kinds()):
+        return "deny", text
+    redact = tuple(k for k in rep.kinds() if rules[k] == "redact")
+    if redact:
+        return "redact", scanmod.scan_value(text, redact, scanmod.Report(),
+                                            redact=True)
+    return "flag", text
+
+
+_CASE_KEYS = ("name", "method", "tool", "arguments", "params", "expect",
+              "reason_contains", "answer", "expect_answer", "answer_contains",
+              "_comment")
+
+
+def run_cases(policy_path: str, cases_path: str) -> int:
+    """`mcp-leash test`: a file of expected decisions, run against a policy
+    with the proxy's own code. Exit 0 all passed, 1 some failed, 2 unusable.
+    A policy change that breaks a case is caught before it ships."""
+    policy_path = expand_path(policy_path)
+    try:
+        pol = load_policy(policy_path)
+    except FileNotFoundError:
+        _say(f"mcp-leash test: no policy at {policy_path}")
+        return 2
+    except (OSError, json.JSONDecodeError, re.error, ValueError,
+            RecursionError) as e:
+        _say(f"mcp-leash test: bad policy: {e}")
+        return 2
+    try:
+        with open(expand_path(cases_path), encoding="utf-8") as f:
+            cases = json.load(f, object_pairs_hook=_no_duplicate_keys,
+                              parse_constant=_no_constants)
+    except (OSError, ValueError, RecursionError) as e:
+        _say(f"mcp-leash test: cannot read the cases {cases_path}: {e}")
+        return 2
+    if not isinstance(cases, list) or not cases:
+        _say("mcp-leash test: the cases file must be a non-empty JSON array")
+        return 2
+    for i, case in enumerate(cases, 1):
+        problem = None
+        if not isinstance(case, dict):
+            problem = "is not an object"
+        else:
+            unknown = [k for k in case if k not in _CASE_KEYS]
+            has_call = "tool" in case or "params" in case
+            if unknown:
+                problem = f"has an unknown key {unknown[0]!r}"
+            elif not has_call and "answer" not in case:
+                problem = "needs a 'tool' (or 'params') and/or an 'answer'"
+            elif has_call and case.get("expect") not in ("allow", "deny"):
+                problem = "needs expect: \"allow\" or \"deny\""
+            elif "answer" in case and case.get("expect_answer") not in (
+                    "clean", "flag", "redact", "deny"):
+                problem = ("needs expect_answer: clean, flag, redact or deny")
+            elif "tool" in case and not isinstance(case["tool"], str):
+                problem = "'tool' must be a string"
+        if problem:
+            _say(f"mcp-leash test: case {i} {problem}")
+            return 2
+    failed = 0
+    for i, case in enumerate(cases, 1):
+        label = _printable(case.get("name") or case.get("tool") or f"case {i}", 80)
+        problems = []
+        if "tool" in case or "params" in case:
+            method = case.get("method", "tools/call")
+            mkey = normalize_tool_name(method)
+            params = case.get("params")
+            if params is None:
+                args = case.get("arguments", {})
+                params = _check_params(mkey, case["tool"], args)
+            if method_denied(pol, method):
+                ok, reason = False, f"method '{method}' is denied by policy"
+            elif not method_policed(pol, method):
+                ok, reason = True, "not a policed method"
+            else:
+                _n, ok, reason = decide_call(pol, mkey, params)
+            got = "allow" if ok else "deny"
+            if got != case["expect"]:
+                problems.append(f"expected {case['expect']}, got {got}"
+                                + (f" ({_printable(reason, 160)})" if reason else ""))
+            needle = case.get("reason_contains")
+            if needle is not None and needle not in reason:
+                problems.append(f"reason {_printable(reason, 160)!r} lacks "
+                                f"{needle!r}")
+        if "answer" in case:
+            verdict, after = judge_answer(pol, case["answer"])
+            if verdict != case["expect_answer"]:
+                problems.append(f"expected the answer to be "
+                                f"{case['expect_answer']}, got {verdict}")
+            needle = case.get("answer_contains")
+            if needle is not None and (not isinstance(after, str)
+                                       or needle not in after):
+                problems.append(f"answer after scanning lacks {needle!r}")
+        if problems:
+            failed += 1
+            print(f"FAIL {label}: " + "; ".join(problems))
+        else:
+            print(f"pass {label}")
+    print(f"\n{len(cases) - failed} passed, {failed} failed")
+    return 1 if failed else 0
+
+
 def check(policy_path: str, tool: "str | None" = None,
           args_text: "str | None" = None,
           method: str = "tools/call", params_text: "str | None" = None) -> int:
@@ -3265,7 +3691,7 @@ def check(policy_path: str, tool: "str | None" = None,
         print(f"ALLOW {method}: not a policed method, relayed unchecked")
         return 0
     else:
-        name, _args, ok, reason = judge_call(pol, mkey, params)
+        name, ok, reason = decide_call(pol, mkey, params)
     shown = _printable(name if isinstance(name, str) else (tool or ""))
     if ok:
         print(f"ALLOW {method} {shown}")

@@ -4,7 +4,9 @@
 against your policy before the server sees it, every decision is written to a
 tamper-evident (hash-chained) audit log, and a server that quietly rewrites a
 tool's description after you approved it (a "rug pull") has that tool taken
-away. Zero dependencies, Python 3.10+, the same on Windows, macOS and Linux.
+away. Secrets, card numbers and injected instructions are caught going in and
+coming out, local servers and remote (Streamable HTTP) ones alike. Zero
+dependencies, Python 3.10+, the same on Windows, macOS and Linux.
 
 It is a policy filter, not a sandbox (see *Limitations*). Formerly mcp-jail:
 the old `mcp-jail` command still works as an alias, and an existing
@@ -63,20 +65,24 @@ do it.
 | | mcp-leash | [Docker MCP Gateway][docker] | [Lasso MCP Gateway][lasso] | [ToolHive][toolhive] | [VellaVeto][vella] | [mcpwall][mcpwall] |
 |---|---|---|---|---|---|---|
 | Runs as | stdio proxy, one per server | gateway for containerised servers | gateway (Python) | runs servers in containers | proxy (Rust), several modes | stdio proxy (npm) |
-| Transports | stdio | stdio, SSE, streaming | | | stdio, HTTP, SSE, WebSocket, gRPC | stdio |
+| Transports | stdio, and a remote Streamable HTTP server via `--url` | stdio, SSE, streaming | | | stdio, HTTP, SSE, WebSocket, gRPC | stdio |
 | Per-tool allow/deny | yes | `--tools` list | | Cedar policies, default deny | yes | YAML rules |
 | Rules on argument values | regex + JSON type, any depth | | | | glob/regex/domain | regex, glob, path checks |
 | Policy written for you from observed traffic | `learn` | | | | | |
-| Secret / PII scanning | no | `--block-secrets` | secrets, PII (Presidio) | | DLP | secrets, response redaction |
+| Secret / PII scanning | arguments and answers, `scan` (15 secret rules, cards, SIN/SSN/IBAN, injection phrases, hidden characters) | `--block-secrets` | secrets, PII (Presidio) | | DLP | secrets, response redaction, injection patterns |
+| Dry run on live traffic | `--monitor` | | | | | |
+| Rate / size limits | `limits` | | | | | |
 | Tool-definition pinning (rug pull) | `tool_pins` | | | | drift detection | |
 | Hash-chained audit log | SHA-256 or HMAC-SHA256, `verify-audit` | `--log-calls` | tracing plugin | | SHA-256 chain, Merkle, Ed25519 | JSONL logs |
 | Process isolation | no (not a sandbox) | containers, `--block-network` | | containers | | |
 | Dependencies | none (stdlib) | Docker | Python packages | | Rust binary | Node.js |
 
 Where others are ahead, plainly: Docker MCP Gateway and ToolHive isolate the
-server process in a container, which mcp-leash does not; Docker, Lasso,
-VellaVeto and mcpwall scan for secrets or PII and mcp-leash does not; Docker
-and VellaVeto speak HTTP transports and mcp-leash speaks stdio only. VellaVeto's
+server process in a container, which mcp-leash does not; Docker and VellaVeto
+serve HTTP/SSE to clients, while mcp-leash reaches a remote server over
+Streamable HTTP but still talks stdio to your client, and has no client-side
+SSE/GET stream. mcp-leash's scanner is a regex-and-checksum net, not
+Presidio-grade PII detection. VellaVeto's
 audit chain adds Merkle proofs and signed checkpoints; tool-definition pinning
 was described for [Pipelock][pipelock] before mcp-leash had it. What mcp-leash
 offers that we did not find elsewhere: a default-deny, typed argument
@@ -84,6 +90,19 @@ allowlist generated from a real session (`learn`), a parser that refuses the
 JSON tricks used to slip a second call past a filter (duplicate keys,
 case-variant members, bare CR; see *Protocol handling*), and all of it in one
 dependency-free Python package you can read in an afternoon.
+
+Measured on this machine (`benchmarks/bench_scan.py`, a corpus built from the
+formats the rules know, so the 100% mostly shows the rules do what they say;
+it is not a claim about unknown formats): mcp-leash redacted 600 of 600 planted
+values with 0 false positives on 600 benign look-alikes. mcpwall 0.3.1 with its
+default rules, run through the same harness (`--proxy`), stopped 394 of 600
+(66%; it missed Google API keys, card and SSN numbers, most `key=value`
+secrets) and altered 41 of 600 benign samples. Different defaults, one
+corpus: rerun it with your own samples. Added latency per call
+(`benchmarks/bench_overhead.py`, this 2-vCPU VM, 2000 calls, p50): learned
+policy about 0.36 ms over a direct pipe, +0.09 ms more with scanning both
+ways; mcpwall added about 0.17 ms at p50 on the same run (its p99 was 2.3 ms
+against 0.9 ms for mcp-leash). mcpwall is faster at the median.
 
 [docker]: https://docs.docker.com/reference/cli/docker/mcp/gateway/run.md
 [lasso]: https://awesome.ecosyste.ms/projects/github.com%2Flasso-security%2Fmcp-gateway
@@ -142,7 +161,12 @@ mcp-leash pin --policy policy.json --accept-changed -- npx -y some-mcp-server
 mcp-leash check --policy policy.json          # summary + warnings, no server
 mcp-leash check --policy policy.json run_cmd '{"cmd": "ls"}'   # one decision
 mcp-leash check --policy policy.json --method prompts/get --params '{"name": "greet"}'
+mcp-leash --policy policy.json --url https://host/mcp --header-env Authorization=MY_AUTH   # a remote server
+mcp-leash --policy policy.json --monitor -- npx -y some-mcp-server    # judge and log, block nothing
+mcp-leash test --policy policy.json cases.json   # run expected decisions (for CI)
 mcp-leash verify-audit                        # is the audit log intact?
+mcp-leash verify-audit --all                  # ... including rotated files
+mcp-leash rotate-audit                        # start a new log file, chain intact
 mcp-leash verify-audit --anchor sha256:...    # ... and does it still hold that head?
 mcp-leash --help                              # every flag, explained
 mcp-leash -- check                            # a server command named like a subcommand
@@ -800,11 +824,18 @@ The jail is a transparent JSON-RPC relay apart from the policy check:
 What mcp-leash does not do, in plain words (the two caveats on deny
 patterns and on `learn` above apply as well):
 
-- **stdio only.** mcp-leash wraps servers your client starts as a local
-  process. It does not proxy the HTTP transports (Streamable HTTP, SSE) that
-  remote servers use; for those, a gateway that speaks HTTP is needed.
-- **No content scanning.** It does not look for secrets or personal data in
-  arguments or in what the server sends back, beyond the regexes you write.
+- **Your client talks stdio.** mcp-leash does not listen on HTTP for clients.
+  A remote server is reached with `--url` (Streamable HTTP, tested against
+  the official Python SDK server), but the optional GET stream, stream
+  resumption (`Last-Event-ID`) and the legacy SSE transport are not
+  implemented, so server messages that arrive outside a request's own reply
+  are not delivered.
+- **Scanning is a net with holes.** It finds the formats it has rules for,
+  after removing invisible characters and folding full-width forms. It does
+  not decode base64/hex/URL encoding, join a value split over two arguments,
+  or see Cyrillic look-alike letters; injection detection is a short list of
+  phrases, not a model. It scans about 5-8 MB/s, on the proxy's one thread.
+  Dictionary keys are not scanned.
 
 - **It is a policy filter, not a sandbox.** mcp-leash inspects JSON-RPC
   messages on the pipe. It does not confine the server *process*: the
@@ -846,6 +877,63 @@ patterns and on `learn` above apply as well):
   rounded to the nearest double, and `1E2` arrives as `100.0`. The jail
   cannot forward the original digits without forwarding the original
   bytes.
+
+## Content scanning
+
+Add a `scan` block to the policy. Each section maps a detector to an action:
+
+```json
+"scan": {
+  "arguments":    {"secrets": "deny", "pii": "flag", "hidden": "deny"},
+  "results":      {"secrets": "redact", "pii": "redact", "injection": "deny",
+                   "hidden": "redact"},
+  "descriptions": {"injection": "hide"}
+}
+```
+
+- Detectors: `secrets` (AWS, GitHub, Slack, Stripe, Google, Anthropic, OpenAI-style,
+  npm, PyPI, SendGrid keys; JWTs; PEM private keys; passwords in database URLs;
+  `Bearer` tokens and `key = value` lines above an entropy floor), `pii` (card
+  numbers with Luhn and a known prefix, Canadian SIN, US SSN, IBAN with
+  mod-97), `injection` (phrases such as "ignore previous instructions",
+  `<IMPORTANT>`, "do not tell the user", "send ~/.ssh/id_rsa"), `hidden`
+  (zero-width, bidi-override and Unicode tag characters).
+- `arguments` (what the agent sends): `deny` refuses the call, `flag` lets it
+  through and notes it. `results` (what the server answers, errors too): `redact`
+  replaces each match with `[mcp-leash: redacted <rule>]`, `deny` swaps the
+  answer for an error, `flag` notes it. `descriptions` (tool listings): `hide`
+  removes the tool and denies its calls, `flag` notes it. With `descriptions`
+  on, a call made while a `tools/list` is unanswered is denied.
+- The audit record names the rule and where (`content.0.text`), never the
+  matched text. Audit logs themselves now have secrets and card numbers
+  replaced before arguments are written (`"audit_redact": false` turns that off).
+- `limits`: `{"max_calls": 500, "calls_per_minute": 60, "max_result_bytes": 200000,
+  "per_tool": {"run_cmd": {"max_calls": 5}}}`. Per session; a denied call
+  does not use the allowance; an answer over `max_result_bytes` becomes an error.
+- `mcp-leash --monitor` judges and logs everything the same way but blocks,
+  hides and redacts nothing; records read `would_deny` / `would_redact`. Run a
+  new policy this way before enforcing it.
+- `mcp-leash test --policy p.json cases.json`: cases such as
+  `{"tool": "read_file", "arguments": {"path": "/etc/passwd"}, "expect": "deny"}`
+  or `{"answer": "<text>", "expect_answer": "redact"}`, using the proxy's own
+  code; exit 1 if any fails, for CI. `check` now applies `scan.arguments` too.
+
+## Remote servers and log rotation
+
+`--url https://host/mcp` (also on `learn` and `pin`) makes mcp-leash the stdio
+face of a Streamable HTTP server: each message is POSTed, a JSON or event-stream
+reply is read back, `Mcp-Session-Id` and `MCP-Protocol-Version` are kept, the
+session is closed with DELETE. Every policy feature applies unchanged. Credentials
+go in `--header-env Name=ENVVAR` (a `--header` value shows in the process list,
+and a URL must not carry one). TLS is always verified, redirects are never
+followed, and plain `http://` is accepted only for localhost
+(`--allow-insecure-http` overrides).
+
+`"audit_max_bytes": 10000000` rotates the log by itself; `mcp-leash rotate-audit`
+does it on demand. The old file is renamed `audit.jsonl.<UTC stamp>` (nothing is
+deleted), and the new one starts with a `rotated` record that continues the hash
+chain, so `mcp-leash verify-audit --all` checks every file as one chain. The
+lock is now a separate `audit.jsonl.lock` file on every platform.
 
 ## Why not just audit?
 

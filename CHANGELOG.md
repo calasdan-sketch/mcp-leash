@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.0 (unreleased)
+
+- **Content scanning** (`scan` policy block, `mcp_leash/scan.py`): secrets, card/SIN/SSN/IBAN numbers, injected-instruction phrases and hidden characters, in call arguments (`deny`/`flag`), server answers (`redact`/`deny`/`flag`) and tool descriptions (`hide`/`flag`). Invisible characters and full-width forms do not hide a value. Findings carry the rule and location, never the text. `benchmarks/bench_scan.py` measures recall, false positives and speed, and can run another proxy through the same corpus.
+- **Remote servers**: `--url` (also `learn`, `pin`) speaks Streamable HTTP to the server; tested against the official Python SDK's server. `--header-env`, TLS always verified, no redirects, http only for localhost.
+- **`--monitor`**: dry run on live traffic (`would_deny`, `would_redact` records).
+- **`limits`**: per-session call ceilings, per-minute rate, per-tool limits, `max_result_bytes`.
+- **`mcp-leash test`**: expected-decision files for policies (CI). `check` applies `scan.arguments`.
+- **Audit**: secrets and card numbers are redacted from logged arguments and rejected lines (`audit_redact`, default on: records change for such values); rotation (`audit_max_bytes`, `rotate-audit`, `verify-audit --all`) keeps one chain across files. Breaking: the append lock is now `audit.jsonl.lock` beside the log on POSIX too; `test` and `rotate-audit` are subcommands (put `--` before a server command with that name).
+
 ## 0.8.0 (unreleased)
 
 - **Tamper-evident audit log.** Every record now carries `seq`, `prev` and `hash`: a SHA-256 hash chain, so an edited, deleted, inserted or reordered record is detected. New `mcp-leash verify-audit [FILE] [--anchor HASH]` checks it (exit 0 intact, 1 broken, 2 no log) and prints the head to keep elsewhere. With `MCP_LEASH_AUDIT_KEY` set the chain is HMAC-SHA256 under that key; the key is removed from the wrapped server's environment. Processes sharing one log take a file lock per append (fcntl on POSIX, msvcrt on Windows), so the chain does not fork. Logs from older versions are carried on (their lines count as unchained). Each record also names the session and the policy file's hash (`session`, `policy`).
