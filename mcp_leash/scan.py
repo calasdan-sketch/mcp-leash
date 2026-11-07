@@ -269,9 +269,9 @@ def _view(text: str) -> str:
     return _INVISIBLE.sub("", unicodedata.normalize("NFKC", text))
 
 
-_B64_RUN = re.compile(r"(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{24,}={0,2}(?![A-Za-z0-9+/_=-])")
+_B64_RUN = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{24,}={0,2}(?![A-Za-z0-9+/_=-])")
 _HEX_RUN = re.compile(r"(?<![0-9A-Za-z])(?:[0-9A-Fa-f]{2}){12,}(?![0-9A-Za-z])")
-_PCT_RUN = re.compile(r"(?:[A-Za-z0-9._~+-]|%[0-9A-Fa-f]{2}){6,}")
+_PCT_RUN = re.compile(r"(?:[A-Za-z0-9._~+_-]|%[0-9A-Fa-f]{2}){6,}")
 MAX_DECODE = 1_000_000          # characters of one encoded run worth decoding
 
 
@@ -329,12 +329,37 @@ def _encoded_spans(view: str, kinds, decode: bool):
     return out
 
 
+# Letters of other scripts that read as Latin ones. Folded one-for-one (so
+# positions line up) before the injection phrases are matched: a model reads
+# "ignore prev\u0456ous instructions" as the phrase. Not applied to secrets,
+# which are exact strings. A short table, not the Unicode confusables list.
+_CONFUSABLE = str.maketrans({
+    # Cyrillic
+    "\u0430": "a", "\u0435": "e", "\u043e": "o", "\u0440": "p", "\u0441": "c",
+    "\u0445": "x", "\u0443": "y", "\u0456": "i", "\u0458": "j", "\u0455": "s",
+    "\u04bb": "h", "\u0501": "d", "\u051b": "q", "\u0410": "A", "\u0412": "B",
+    "\u0415": "E", "\u041a": "K", "\u041c": "M", "\u041d": "H", "\u041e": "O",
+    "\u0420": "P", "\u0421": "C", "\u0422": "T", "\u0425": "X", "\u0406": "I",
+    # Greek
+    "\u03b1": "a", "\u03bf": "o", "\u03c1": "p", "\u03bd": "v", "\u03b9": "i",
+    "\u0391": "A", "\u0392": "B", "\u0395": "E", "\u0397": "H", "\u0399": "I",
+    "\u039a": "K", "\u039c": "M", "\u039d": "N", "\u039f": "O", "\u03a1": "P",
+    "\u03a4": "T", "\u03a7": "X", "\u03a5": "Y", "\u0396": "Z",
+})
+
+
 def _passes(text: str, kinds, decode: bool = False):
     """(hidden spans on the text itself, other spans on its view, the view)."""
     hidden = _spans(text, ("hidden",)) if "hidden" in kinds else []
     rest = tuple(k for k in kinds if k != "hidden")
     view = _view(text) if rest else text
     spans = _spans(view, rest) if rest else []
+    if "injection" in rest and not view.isascii():
+        folded = view.translate(_CONFUSABLE)
+        if folded != view:
+            extra = _spans(folded, ("injection",))
+            if extra:
+                spans = _merge(sorted(spans + extra))
     if decode and rest:
         enc = _encoded_spans(view, rest, True)
         if enc:
@@ -364,11 +389,8 @@ def redact_text(text: str, kinds, decode: bool = False) -> "tuple[str, list[tupl
         text = _INVISIBLE.sub("", text)         # what a reader sees; flag-only
         if not rest:                            # callers do not call us
             return text, [(k, r) for _s, _e, k, r in hidden]
-        view = _view(text)
-        rest = _spans(view, tuple(k for k in kinds if k != "hidden"))
-        if decode:
-            rest = _merge(sorted(rest + _encoded_spans(
-                view, tuple(k for k in kinds if k != "hidden"), True)))
+        _h, rest, view = _passes(text, tuple(k for k in kinds if k != "hidden"),
+                                 decode)
     if not rest:
         return text, [(k, r) for _s, _e, k, r in hidden]
     parts, last = [], 0

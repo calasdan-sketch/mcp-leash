@@ -196,6 +196,50 @@ def _wanted(e: dict, args) -> bool:
     return True
 
 
+class _Summary:
+    """Counts over every matching record (not only the last --limit): by
+    decision, then the tools denied most and the reasons given most."""
+
+    def __init__(self):
+        import collections
+        self.n = 0
+        self.by_decision = collections.Counter()
+        self.denied_tools = collections.Counter()
+        self.reasons = collections.Counter()
+        self.first = self.last = None
+
+    def add(self, e: dict) -> None:
+        self.n += 1
+        d = e.get("decision")
+        d = d if isinstance(d, str) else "allow"
+        self.by_decision[d] += 1
+        at = e.get("at")
+        if isinstance(at, (int, float)):
+            self.first = at if self.first is None else min(self.first, at)
+            self.last = at if self.last is None else max(self.last, at)
+        if d in ("deny", "would_deny"):
+            what = e.get("tool") or e.get("method") or e.get("rejected")
+            self.denied_tools[_plain(what)[:80]] += 1
+            self.reasons[_plain(e.get("reason", ""))[:100]] += 1
+
+    def print(self) -> None:
+        import time
+        print(f"{self.n} record(s)")
+        if self.first is not None:
+            fmt = "%Y-%m-%d %H:%M:%S UTC"
+            print(f"from {time.strftime(fmt, time.gmtime(self.first))} "
+                  f"to {time.strftime(fmt, time.gmtime(self.last))}")
+        for d, n in self.by_decision.most_common():
+            print(f"  {d:13}{n}")
+        if self.denied_tools:
+            print("most denied:")
+            for t, n in self.denied_tools.most_common(5):
+                print(f"  {n:6}  {t}")
+            print("most common reasons:")
+            for t, n in self.reasons.most_common(5):
+                print(f"  {n:6}  {t}")
+
+
 def cmd_audit(args) -> int:
     path = jail_mod.audit_log_path()
     if not os.path.exists(path):
@@ -203,6 +247,7 @@ def cmd_audit(args) -> int:
         return 0
     denies = 0
     shown = []
+    summary = _Summary() if getattr(args, "summary", False) else None
     with open(path, encoding="utf-8", errors="replace") as f:
         for ln in f:
             try:
@@ -215,6 +260,11 @@ def cmd_audit(args) -> int:
                 shown.append(e)
                 if len(shown) > args.limit:
                     shown.pop(0)
+                if summary is not None:
+                    summary.add(e)
+    if summary is not None:
+        summary.print()
+        return 0
     if getattr(args, "json", False):
         # one record per line, pure ASCII: safe to pipe into a log shipper
         for e in shown:
@@ -590,6 +640,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--since", type=_since, metavar="WHEN",
                    help="--audit: only records from then on: 30m, 24h, 7d "
                         "or a date like 2026-11-01")
+    p.add_argument("--summary", action="store_true",
+                   help="--audit: counts by decision, the tools denied most "
+                        "and the commonest reasons, over every matching "
+                        "record, instead of listing them")
     p.add_argument("--json", action="store_true",
                    help="--audit: print the records as JSON lines (ASCII "
                         "only) instead of the one-line report")

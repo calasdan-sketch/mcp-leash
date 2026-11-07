@@ -2,6 +2,20 @@
 
 ## 0.9.0 (unreleased)
 
+Round 3 (found by attacking the scanner and reading the audit log as an operator would):
+
+- **Fixed: a text of repeated `-----BEGIN ... PRIVATE KEY-----` headers took minutes to scan** (quadratic: 100,000 headers, about 110 s; now linear, 0.6 s). The rule also fails closed now: a header with no END within 16 KB takes the 16 KB after it (before, it matched only near the end of the text).
+- **Fixed: `blob` / `data` fields in call arguments were never scanned** (they were skipped as image payloads). Only declared non-text payloads in *answers* are skipped now.
+- **Fixed: a crash on invalid percent-escapes** in the new decoder (found by fuzzing; `%aa` is not UTF-8) and **`key=<base64>` was not decoded** (found in review).
+- **Scanning looks at more**: dictionary keys (a secret can be sent as a key name; the audit record shows `<flagged key>`, never the key), the whole `params` of a call (`_meta` reaches the server), and the audit log's own argument view (keys and encoded values are redacted there too). Paths in `scan` findings under `arguments` are unchanged.
+- **`scan.decode: true`** (off by default): base64 (standard and URL-safe), hex and percent-encoded runs are decoded one level and scanned; findings read `base64:github_token`. `check` warns when scanning is on without it.
+- **`scan.server_messages`**: scans requests and notifications the *server* starts (`sampling/createMessage`, `elicitation/create`, `notifications/message`). `deny` drops the message and answers a request with an error sent to the server.
+- **Behaviour change:** with `scan.results` set, answers to `initialize` (the server's `instructions`), `prompts/get|list`, `resources/read|list|templates/list` and `completion/complete` are scanned too, even when not in `policed_methods`. Before, only policed methods were.
+- New rules: Hugging Face, GitLab, Google OAuth, Shopify, DigitalOcean tokens, Azure storage `AccountKey=`; `user:password@` in https/ftp/ssh/smtp/imap URLs; card numbers written with dots. Formats come from public scanner rule lists, not vendor documentation.
+- **`--audit`** gains `--decision`, `--tool GLOB`, `--since 24h|2026-11-01`, `--json` (one ASCII JSON record per line) and `--summary` (counts by decision, most denied tools, commonest reasons).
+- Injection phrases are matched after folding a short table of Cyrillic and Greek look-alike letters (not applied to secrets).
+- Benchmarks: `bench_scan.py` has 16 kinds (800 values) and reports each evasion with and without `decode`.
+
 - **Content scanning** (`scan` policy block, `mcp_leash/scan.py`): secrets, card/SIN/SSN/IBAN numbers, injected-instruction phrases and hidden characters, in call arguments (`deny`/`flag`), server answers (`redact`/`deny`/`flag`) and tool descriptions (`hide`/`flag`). Invisible characters and full-width forms do not hide a value. Findings carry the rule and location, never the text. `benchmarks/bench_scan.py` measures recall, false positives and speed, and can run another proxy through the same corpus.
 - **Remote servers**: `--url` (also `learn`, `pin`) speaks Streamable HTTP to the server; tested against the official Python SDK's server. `--header-env`, TLS always verified, no redirects, http only for localhost.
 - **`--monitor`**: dry run on live traffic (`would_deny`, `would_redact` records).

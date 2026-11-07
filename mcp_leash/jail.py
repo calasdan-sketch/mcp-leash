@@ -1092,6 +1092,14 @@ def filter_tools_list(pol: dict, result) -> None:
 
 _LOG_KINDS = ("secrets", "pii")
 
+# answers whose text reaches the model although no tool was called; scan.results
+# covers them even when the method is not in policed_methods (the server's
+# `instructions` come with `initialize`, prompt messages with `prompts/get`)
+_CONTENT_METHODS = frozenset((
+    "initialize", "resources/read", "resources/list",
+    "resources/templates/list", "prompts/get", "prompts/list",
+    "completion/complete"))
+
 
 def audit_args_view(value, depth: int = 0, redact: bool = True):
     """Copy of call arguments fit for the log: every string cut to
@@ -2236,11 +2244,13 @@ class _Proxy:
             audit(dict(event, decision="flag", reason=why))
         return True
 
-    def _scan_result(self, msg: dict, entry: dict) -> bool:
+    def _scan_result(self, msg: dict, entry: dict,
+                     scan_only: bool = False) -> bool:
         """limits.max_result_bytes and scan.results on the answer to a
-        policed request. False: the answer was replaced by an error."""
+        policed request (scan.results alone for the other content-bearing
+        methods). False: the answer was replaced by an error."""
         ceiling = (self.pol.get("_limits") or {}).get("max_result_bytes")
-        if ceiling:
+        if ceiling and not scan_only:
             try:
                 size = len(_encode(msg))
             except (RecursionError, ValueError):
@@ -2424,10 +2434,16 @@ class _Proxy:
         if entry["method"] == "tools/call" and entry.get("call") is not None:
             if self.observer is not None and _call_succeeded(msg):
                 self.observer.on_call(*entry["call"])
-        if (self.pol is not None and entry["method"] != "tools/list"
-                and method_policed(self.pol, entry["method"])
-                and not self._scan_result(msg, entry)):
-            return False
+        if (self.pol is not None and entry["method"] != "tools/list"):
+            if method_policed(self.pol, entry["method"]):
+                if not self._scan_result(msg, entry):
+                    return False
+            elif (entry["method"] in _CONTENT_METHODS
+                    and self._scan.get("results")):
+                # text the server hands the model without a tool call:
+                # scanned too, though the method is not in policed_methods
+                if not self._scan_result(msg, entry, scan_only=True):
+                    return False
         if entry["method"] == "tools/list" and "result" in msg:
             if self.observer is not None:
                 self.observer.on_tools(msg["result"])

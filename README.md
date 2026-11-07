@@ -58,9 +58,10 @@ OK /home/me/.mcp-leash/audit.jsonl: 2 chained record(s) (sha256)
 
 ## How it compares
 
-Checked on 2026-11-05 against each project's own documentation (linked). A
-blank means the page we read did not mention it, not that the product cannot
-do it.
+Checked on 2026-11-05 against each project's own documentation (linked), and
+re-read on 2026-11-07 for mcpwall (npm still at 0.3.1) and VellaVeto (its
+[GitHub README][vella-readme], read in full; see below). A blank means the
+page we read did not mention it, not that the product cannot do it.
 
 | | mcp-leash | [Docker MCP Gateway][docker] | [Lasso MCP Gateway][lasso] | [ToolHive][toolhive] | [VellaVeto][vella] | [mcpwall][mcpwall] |
 |---|---|---|---|---|---|---|
@@ -69,7 +70,7 @@ do it.
 | Per-tool allow/deny | yes | `--tools` list | | Cedar policies, default deny | yes | YAML rules |
 | Rules on argument values | regex + JSON type, any depth | | | | glob/regex/domain | regex, glob, path checks |
 | Policy written for you from observed traffic | `learn` | | | | | |
-| Secret / PII scanning | arguments and answers, `scan` (15 secret rules, cards, SIN/SSN/IBAN, injection phrases, hidden characters) | `--block-secrets` | secrets, PII (Presidio) | | DLP | secrets, response redaction, injection patterns |
+| Secret / PII scanning | arguments, answers and server-started messages, `scan` (21 secret rules, cards, SIN/SSN/IBAN, injection phrases, hidden characters; base64/hex/percent runs with `decode`) | `--block-secrets` | secrets, PII (Presidio) | | DLP, multi-layer decoding | secrets, response redaction, injection patterns |
 | Dry run on live traffic | `--monitor` | | | | | |
 | Rate / size limits | `limits` | | | | | |
 | Tool-definition pinning (rug pull) | `tool_pins` | | | | drift detection | |
@@ -77,7 +78,11 @@ do it.
 | Process isolation | no (not a sandbox) | containers, `--block-network` | | containers | | |
 | Dependencies | none (stdlib) | Docker | Python packages | | Rust binary | Node.js |
 
-Where others are ahead, plainly: Docker MCP Gateway and ToolHive isolate the
+Where others are ahead, plainly: VellaVeto's README describes a five-layer
+decode before DLP and injection matching (base64, ROT13 and more) and policy
+for sampling and elicitation; mcp-leash decodes base64, hex and percent runs
+one level deep and applies pattern checks, not policy, to what a server starts
+(`scan.server_messages`). Docker MCP Gateway and ToolHive isolate the
 server process in a container, which mcp-leash does not; Docker and VellaVeto
 serve HTTP/SSE to clients, while mcp-leash reaches a remote server over
 Streamable HTTP but still talks stdio to your client, and has no client-side
@@ -93,21 +98,26 @@ dependency-free Python package you can read in an afternoon.
 
 Measured on this machine (`benchmarks/bench_scan.py`, a corpus built from the
 formats the rules know, so the 100% mostly shows the rules do what they say;
-it is not a claim about unknown formats): mcp-leash redacted 600 of 600 planted
-values with 0 false positives on 600 benign look-alikes. mcpwall 0.3.1 with its
-default rules, run through the same harness (`--proxy`), stopped 394 of 600
-(66%; it missed Google API keys, card and SSN numbers, most `key=value`
-secrets) and altered 41 of 600 benign samples. Different defaults, one
-corpus: rerun it with your own samples. Added latency per call
-(`benchmarks/bench_overhead.py`, this 2-vCPU VM, 2000 calls, p50): learned
-policy about 0.36 ms over a direct pipe, +0.09 ms more with scanning both
-ways; mcpwall added about 0.17 ms at p50 on the same run (its p99 was 2.3 ms
-against 0.9 ms for mcp-leash). mcpwall is faster at the median.
+it is not a claim about unknown formats): mcp-leash redacted 800 of 800 planted
+values (16 kinds) with 0 false positives on 600 benign look-alikes. The same
+script tries 11 ways of hiding one token: 2 are found by default, 6 with
+`decode`, and 5 are missed (split in two, spaced out, reversed, a Cyrillic
+look-alike, URL-encoding with NUL bytes). mcpwall 0.3.1 with its default rules,
+run through the same harness on the earlier 12-kind corpus (`--proxy`; not
+re-run this round, so not comparable to the 800), stopped 394 of 600 (66%; it
+missed Google API keys, card and SSN numbers, most `key=value` secrets) and
+altered 41 of 600 benign samples. Different defaults, one corpus: rerun it
+with your own samples. Added latency per call (`benchmarks/bench_overhead.py`,
+this 2-vCPU VM, 2000 calls, p50; noisy on a shared machine, the p99 moved from
+5 to 8 ms between runs): learned policy about 0.2 ms over a direct pipe, about
+0.35 ms with scanning both ways. mcpwall added about 0.17 ms at p50 when we
+last ran it (previous round), so it is faster at the median.
 
 [docker]: https://docs.docker.com/reference/cli/docker/mcp/gateway/run.md
 [lasso]: https://awesome.ecosyste.ms/projects/github.com%2Flasso-security%2Fmcp-gateway
 [toolhive]: https://stacklok.com/blog/enforcing-mcp-tool-annotation-policies-with-cedar/
 [vella]: https://awesome.ecosyste.ms/projects/github.com%2Fpaolovella%2Fvellaveto
+[vella-readme]: https://github.com/paolovella/vellaveto
 [mcpwall]: https://www.mdskills.ai/mcp-servers/mcp-firewall
 [pipelock]: https://dev.to/luckypipewrench/your-mcp-servers-tool-descriptions-are-an-attack-surface-37pj
 
@@ -155,7 +165,8 @@ mcp-leash --policy policy.json --timeout 10 -- npx -y some-mcp-server
 mcp-leash --policy policy.json --grace 10 -- npx -y some-mcp-server
 mcp-leash --audit                             # who got denied lately
 mcp-leash --audit --decision deny --since 24h # only denials, last day
-mcp-leash --audit --tool 'read_*' --json      # matching records as JSON lines (ASCII), for a log shipper
+mcp-leash --audit --since 7d --summary        # counts: by decision, most denied tools, commonest reasons
+mcp-leash --audit --tool 'read_*' --json      # matching records as JSON lines (ASCII), for a log shipper (current file only)
 mcp-leash learn --script calls.json --out policy.json -- npx -y some-mcp-server
 mcp-leash pin --policy policy.json -- npx -y some-mcp-server   # pin tool definitions
 mcp-leash pin --policy policy.json --dry-run -- npx -y some-mcp-server
@@ -837,7 +848,8 @@ patterns and on `learn` above apply as well):
   `decode` it looks inside base64, hex and percent-encoded runs (one level);
   it does not join a value split over two arguments, undo a reversal or
   character spacing, decode `\\u0067`-style or HTML escapes, or see Cyrillic
-  look-alike letters; injection detection is a short list of phrases, not a
+  look-alike letters inside a secret (injection phrases fold a short table of
+  Cyrillic and Greek look-alikes first); injection detection is a short list of phrases, not a
   model. It scans about 3 MB/s on this 2-vCPU VM (`benchmarks/bench_scan.py`),
   on the proxy's one thread. Requests the client sends that are not policed
   (`policed_methods`) and the client's replies to the server's own requests are
@@ -915,6 +927,11 @@ Add a `scan` block to the policy. Each section maps a detector to an action:
   answer for an error, `flag` notes it. `descriptions` (tool listings): `hide`
   removes the tool and denies its calls, `flag` notes it. With `descriptions`
   on, a call made while a `tools/list` is unanswered is denied.
+- `results` also covers the answers to `initialize` (the server's
+  `instructions` go to the model), `prompts/get`, `prompts/list`,
+  `resources/read`, `resources/list`, `resources/templates/list` and
+  `completion/complete`, whether or not they are in `policed_methods`
+  (`limits.max_result_bytes` still applies to policed methods only).
 - `server_messages` (what the server starts by itself: `sampling/createMessage`,
   `elicitation/create`, `notifications/message`...): same actions as `results`.
   `deny` drops the message, and a request is answered with an error sent to the
