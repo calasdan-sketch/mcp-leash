@@ -2,6 +2,18 @@
 
 ## 0.9.0 (unreleased)
 
+Round 4 (what a stranger gets from `pip install`; found by installing the built wheel into a clean environment and using it):
+
+- **`mcp-leash demo`**: a five-second tour that needs no MCP server of your own. It runs a made-up server behind a small policy and shows an allowed call, a refused path, an unlisted tool, a token caught in an argument, a rug pull, and the audit chain verifying. Everything happens in a throwaway folder. New subcommand name: a server command called `demo` given first now needs `--` before it.
+- **Fixed: a policy, `learn` script or `test` file saved by Windows Notepad (UTF-8 with a byte-order mark) was refused** as invalid JSON; it is read now. One saved as UTF-16 (PowerShell's `>`) is refused with a message that says so, not a codec error.
+- **New policy key `audit_required`** (default `false`): when the audit record of an allowed call cannot be written (full disk, read-only folder, lock failure) the call is denied instead of going through with a warning.
+- **Fixed: the documented test command `python -m unittest discover -s tests` loaded only 370 of the 467 tests** (three modules failed to import and the run said `FAILED`); the README and CI now use `-t .`.
+- **Readable errors for an unreachable `--url` server**: "the host name could not be found", "connection refused", "timed out", "TLS failed" instead of an exception class name (never the exception text, which can carry a URL).
+- Reading a client line is linear in its length again (it re-searched the whole buffer for each 64 KB chunk) and a cheaper test for decoded text. Large messages are still slow to scan; see *Limitations*.
+- Packaging: author, `Source` and `Changelog` URLs, Development Status/Audience classifiers; project URLs point at `mcp-leash` (they named the old `mcp-jail` repository); the sdist now carries the changelog and benchmarks; CI also installs the wheel on Windows and checks the `mcp-jail` alias.
+- README: install line is `pip install mcp-leash` (0.9.0 or later); the latest registry release before this was 0.7.0, so 0.8.0 and 0.9.0 ship together.
+- Round 4 notes, scored ideas and what could not be tested: `docs/ROUND4.md`.
+
 Round 3 (found by attacking the scanner and reading the audit log as an operator would):
 
 - **Fixed: a text of repeated `-----BEGIN ... PRIVATE KEY-----` headers took minutes to scan** (quadratic: 100,000 headers, about 110 s; now linear, 0.6 s). The rule also fails closed now: a header with no END within 16 KB takes the 16 KB after it (before, it matched only near the end of the text).

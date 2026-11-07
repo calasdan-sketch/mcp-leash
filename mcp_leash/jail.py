@@ -402,7 +402,7 @@ def _compile_rule_set(spec, where: str = "arg_rules",
 POLICY_KEYS = ("allow_tools", "deny_tools", "arg_rules", "policed_methods",
                "deny_methods", "strict_args", "audit_args", "hide_denied",
                "tool_pins", "require_pins", "scan", "limits", "audit_redact",
-               "audit_max_bytes")
+               "audit_max_bytes", "audit_required")
 # Notes: written by --init-policy and by `learn`, never read.
 NOTE_KEYS = ("_comment", "_not_called")
 RULE_KEYS = ("allow", "deny")  # the keys of one arg_rules.<tool> entry
@@ -605,6 +605,8 @@ def compile_policy(pol: dict) -> dict:
     if not isinstance(pol.get("require_pins", False), bool):
         raise ValueError("require_pins must be true or false")
     pol["_pins_by_norm"] = _compile_pins(pol.get("tool_pins"))
+    if not isinstance(pol.get("audit_required", False), bool):
+        raise ValueError("audit_required must be true or false")
     if not isinstance(pol.get("audit_redact", True), bool):
         raise ValueError("audit_redact must be true or false")
     ceiling = pol.get("audit_max_bytes")
@@ -780,17 +782,34 @@ def _compile_pins(pins) -> dict:
     return out
 
 
+def read_json_text(path: str) -> str:
+    """Text of a user-written JSON file. A UTF-8 byte-order mark (Windows
+    Notepad and PowerShell add one) is dropped; UTF-16/32 (what PowerShell's
+    `>` writes) is refused in plain words, not as a codec error."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    elif raw.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\0" in raw[:4]:
+        raise ValueError("the file is UTF-16 or UTF-32 text (PowerShell's `>` "
+                         "writes that); save it again as UTF-8")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("the file is not valid UTF-8 text; save it again "
+                         "as UTF-8") from None
+
+
 def load_policy(path: str) -> dict:
     """Read and compile a policy file. Refused (ValueError, JSONDecodeError
     or re.error): invalid JSON, a duplicate key anywhere (the reader would
     keep only the last one: `deny_tools` twice is `deny_tools` once, and the
     wrong one), the internal markers, an unknown key, a bad rule."""
-    with open(path, encoding="utf-8") as f:
-        try:
-            pol = json.load(f, object_pairs_hook=_no_duplicate_keys,
-                            parse_constant=_no_constants)
-        except _DuplicateKey as e:
-            raise ValueError(f"{e} (a key may appear once)") from None
+    try:
+        pol = json.loads(read_json_text(path), object_pairs_hook=_no_duplicate_keys,
+                         parse_constant=_no_constants)
+    except _DuplicateKey as e:
+        raise ValueError(f"{e} (a key may appear once)") from None
     if isinstance(pol, dict):
         for key in _INTERNAL_KEYS:
             if key in pol:
@@ -1151,10 +1170,11 @@ def _open_private_append(path: str):
 _policy_digest: "str | None" = None
 
 
-def audit(event: dict) -> None:
+def audit(event: dict) -> bool:
     """Append one JSON line to the audit log, as the next link of its hash
     chain (see ledger.py). An unwritable log is reported on stderr but never
-    takes the firewall down: the decision has already been enforced."""
+    takes the firewall down: the decision has already been enforced. True
+    when the record was written (the policy key `audit_required` uses it)."""
     path = audit_log_path()
     event["at"] = int(time.time())
     event["session"] = ledger.SESSION
@@ -1164,11 +1184,13 @@ def audit(event: dict) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         ledger.append(path, event, _open_private_append,
                       warn=lambda note: _say(f"mcp-leash: audit log: {note}"))
+        return True
     except (OSError, ledger.KeyProblem) as e:
         # loud, every time: the decision stands, its record does not
         what = event.get("tool") or event.get("method") or "a message"
         _say(f"mcp-leash: AUDIT RECORD NOT WRITTEN for {_printable(what, 80)} "
              f"({event.get('decision')}) to {path}: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1280,17 +1302,19 @@ class _FdLineReader:
         self._eof = False
 
     def readline(self) -> bytes:
+        scanned = 0         # bytes of _buf already known to hold no newline
         while True:
-            i = self._buf.find(b"\n")
+            i = self._buf.find(b"\n", scanned)
             if i >= 0:
                 line = bytes(self._buf[:i + 1])
                 del self._buf[:i + 1]
                 return line
+            scanned = len(self._buf)    # not re-searched: a long line stays linear
             if self._eof:
                 line = bytes(self._buf)
                 self._buf.clear()
                 return line
-            chunk = os.read(self._fd, 65536)
+            chunk = os.read(self._fd, 1 << 20)
             if not chunk:
                 self._eof = True
             else:
@@ -1980,7 +2004,7 @@ class _Proxy:
 
     def _audit(self, name, args, ok: bool, reason: str,
                method: str = "tools/call", decision: "str | None" = None,
-               extra: "dict | None" = None) -> None:
+               extra: "dict | None" = None) -> bool:
         event = {"decision": decision or ("allow" if ok else "deny"),
                  "reason": reason}
         if extra:
@@ -1993,7 +2017,7 @@ class _Proxy:
         if mode == "all" or (mode == "denied" and not ok):  # also would_deny
             event["args"] = audit_args_view(
                 args, redact=self.pol.get("audit_redact", True))
-        audit(event)
+        return audit(event)
 
     # -- client -> server ---------------------------------------------------
 
@@ -2116,7 +2140,12 @@ class _Proxy:
                                 decision="would_deny", extra=extra)
                     ok = True
                 else:
-                    self._audit(name, targs, ok, reason, method, extra=extra)
+                    wrote = self._audit(name, targs, ok, reason, method,
+                                        extra=extra)
+                    if ok and not wrote and self.pol.get("audit_required"):
+                        ok = False
+                        reason = ("the audit log cannot be written and the "
+                                  "policy says audit_required")
             if not ok:
                 # Same id, same type, as the request. A notification
                 # (no id) never gets a response — it is just dropped.
@@ -3099,11 +3128,10 @@ def load_script(path: str) -> list[dict]:
     """Read and validate a learn --script file: a JSON array of
     {"tool": "<name>", "arguments": {...}} ("arguments" optional).
     Raises ValueError (or OSError) with a message fit for the user."""
-    with open(path, encoding="utf-8") as f:
-        try:
-            calls = json.load(f)
-        except ValueError as e:
-            raise ValueError(f"not valid JSON ({e})") from None
+    try:
+        calls = json.loads(read_json_text(path))
+    except ValueError as e:
+        raise ValueError(f"not valid JSON ({e})") from None
     if not isinstance(calls, list):
         raise ValueError('must be a JSON array of {"tool": ..., '
                          '"arguments": {...}}')
@@ -3408,9 +3436,9 @@ def pin(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
         return 2
     policy_path = expand_path(policy_path)
     try:
-        with open(policy_path, encoding="utf-8") as f:
-            raw = json.load(f, object_pairs_hook=_no_duplicate_keys,
-                            parse_constant=_no_constants)
+        raw = json.loads(read_json_text(policy_path),
+                         object_pairs_hook=_no_duplicate_keys,
+                         parse_constant=_no_constants)
         pol = compile_policy(copy.deepcopy(raw))
     except FileNotFoundError:
         _say(f"mcp-leash pin: no policy at {policy_path}")
@@ -3642,9 +3670,9 @@ def run_cases(policy_path: str, cases_path: str) -> int:
         _say(f"mcp-leash test: bad policy: {e}")
         return 2
     try:
-        with open(expand_path(cases_path), encoding="utf-8") as f:
-            cases = json.load(f, object_pairs_hook=_no_duplicate_keys,
-                              parse_constant=_no_constants)
+        cases = json.loads(read_json_text(expand_path(cases_path)),
+                           object_pairs_hook=_no_duplicate_keys,
+                           parse_constant=_no_constants)
     except (OSError, ValueError, RecursionError) as e:
         _say(f"mcp-leash test: cannot read the cases {cases_path}: {e}")
         return 2

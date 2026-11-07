@@ -16,7 +16,12 @@ does not exist.
 ## Quick start
 
 ```bash
-pip install git+https://github.com/calasdan-sketch/mcp-jail
+pip install mcp-leash          # needs 0.9.0 or later: check with `mcp-leash --version`
+# the newest source, if PyPI is behind:
+# pip install git+https://github.com/calasdan-sketch/mcp-leash
+
+# 0. no server of your own yet? a 5-second tour with a made-up one:
+mcp-leash demo
 
 # 1. watch the server do its job once, and write the tightest policy that allows it
 mcp-leash learn --script calls.json --out ~/.mcp-leash/policy.json -- npx -y some-mcp-server
@@ -150,7 +155,8 @@ not start (a script with no `#!` line).
 Zero dependencies — Python 3.10+ stdlib only.
 
 ```bash
-pip install git+https://github.com/calasdan-sketch/mcp-jail
+pip install mcp-leash                  # 0.9.0 or later (older releases lack most of this page)
+pip install git+https://github.com/calasdan-sketch/mcp-leash    # or the newest source
 mcp-leash --version
 ```
 
@@ -181,12 +187,13 @@ mcp-leash verify-audit                        # is the audit log intact?
 mcp-leash verify-audit --all                  # ... including rotated files
 mcp-leash rotate-audit                        # start a new log file, chain intact
 mcp-leash verify-audit --anchor sha256:...    # ... and does it still hold that head?
+mcp-leash demo                                # a tour with a made-up server; nothing to set up
 mcp-leash --help                              # every flag, explained
 mcp-leash -- check                            # a server command named like a subcommand
 ```
 
-`learn`, `pin`, `check` and `verify-audit` are subcommands when they come
-first. **Breaking change in 0.8.0:** a server command whose name is `pin`,
+`learn`, `pin`, `check`, `test`, `rotate-audit`, `verify-audit` and `demo` are
+subcommands when they come first. **Breaking change in 0.8.0:** a server command whose name is `pin`,
 `check` or `verify-audit`, given first (`mcp-leash check ...`), is now read as
 the subcommand. Put `--` before it (`mcp-leash --policy p.json -- check`),
 which has always worked and is what the client config above does.
@@ -231,7 +238,9 @@ only its keys and drop the rules nested in it: argument rules go under
 Leaving `allow_tools` out is allowed and means "every tool that
 `deny_tools` does not name"; write `"allow_tools": []` to allow nothing.
 A policy path that is a directory, or cannot be read, is the same exit
-`2`, not a traceback.
+`2`, not a traceback. A policy (or `learn` script, or `test` cases file)
+saved by Windows Notepad with a UTF-8 byte-order mark is read; one saved as
+UTF-16 (PowerShell's `>`) is refused with a message that says so.
 
 - `allow_tools` / `deny_tools`: tool names (`*` on its own = all). Deny
   wins: `"deny_tools": ["*"]` refuses every call and hides every tool,
@@ -291,6 +300,10 @@ A policy path that is a directory, or cannot be read, is the same exit
   definition as the server listed it (see *Tool pins* below). `learn` and
   `pin` write them; keys are compared normalised like `allow_tools`, and a
   malformed pin is refused at start-up.
+- `audit_required` (default `false`): when `true`, a `tools/call` that would
+  be allowed is denied instead if its audit record cannot be written (a full
+  disk, a read-only folder, a lock that cannot be taken). Off by default the
+  call goes through and `AUDIT RECORD NOT WRITTEN` is printed on stderr.
 - `require_pins` (default `false`): when `true`, a tool without a pin is
   denied by name (and hidden by `hide_denied`), whatever `allow_tools` says.
 
@@ -850,7 +863,8 @@ patterns and on `learn` above apply as well):
   character spacing, decode `\\u0067`-style or HTML escapes, or see Cyrillic
   look-alike letters inside a secret (injection phrases fold a short table of
   Cyrillic and Greek look-alikes first); injection detection is a short list of phrases, not a
-  model. It scans about 3 MB/s on this 2-vCPU VM (`benchmarks/bench_scan.py`),
+  model. It scans 1 to 3 MB/s on this shared 2-vCPU VM, depending on load
+  (`benchmarks/bench_scan.py`; the same before and after round 4),
   on the proxy's one thread. Requests the client sends that are not policed
   (`policed_methods`) and the client's replies to the server's own requests are
   not scanned.
@@ -876,6 +890,13 @@ patterns and on `learn` above apply as well):
   different file. Deny entries want that folding; allow entries would
   rather not have it. Prefer `deny_tools` / `deny_methods` for resources,
   or keep to lowercase URIs.
+- **Very large messages are slow, not refused.** There is no size ceiling on
+  one JSON-RPC line, and with scanning on, a single 16 MB argument took about
+  4 s to judge and a 50 MB one about 30 s (measured on a 2-vCPU VM, one thread,
+  `scan` rules and `decode` on); peak memory was about 7 times the message (118 MB for 16 MB).
+  A client or server that sends an unbounded line without a newline can use
+  all the memory there is. Run mcp-leash under a memory limit
+  (`ulimit -v`, a container, a job object on Windows) if either side is not trusted.
 - **A stalled server is stopped by killing the process mcp-leash
   started.** A grandchild that still holds the server's stdin open
   (`npx` starting node) is not, and a write stuck on it can outlive the
@@ -983,7 +1004,7 @@ is watching. The jail is the enforcement half of the story.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests   # fake stdio servers (+ the official MCP SDK when installed)
+python3 -m unittest discover -s tests -t .   # fake stdio servers (+ the official MCP SDK when installed)
 python3 -m pytest -q                    # same suite
 ```
 

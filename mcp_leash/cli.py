@@ -12,6 +12,7 @@ finds the problems; mcp-leash enforces least-privilege at runtime.
   mcp-leash test --policy p.json cases.json            # policy test cases
   mcp-leash verify-audit                 # check the audit log's hash chain
   mcp-leash rotate-audit                 # start a new log file, chain intact
+  mcp-leash demo                         # a 5-second tour, nothing to set up
 """
 
 from __future__ import annotations
@@ -605,7 +606,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="mcp-leash", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="subcommands (each has --help): learn, pin, check, test, "
-               "verify-audit, rotate-audit\n\n"
+               "verify-audit, rotate-audit, demo\n\n"
                "exit status: 0 a clean session; 2 an unusable policy or "
                "command; 3 the server failed (it exited or closed its pipes, "
                "stopped reading its input, or did not answer a request "
@@ -671,6 +672,15 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def cmd_demo(argv: list[str]) -> int:
+    """mcp-leash demo: a self-contained tour (see demo.py)."""
+    if argv:
+        jail_mod._say("mcp-leash demo: takes no arguments")
+        return 2
+    from . import demo
+    return demo.run()
+
+
 def _main(argv: list[str]) -> int:
     if argv[:1] == ["learn"]:
         return cmd_learn(argv[1:])
@@ -684,6 +694,8 @@ def _main(argv: list[str]) -> int:
         return cmd_verify_audit(argv[1:])
     if argv[:1] == ["rotate-audit"]:
         return cmd_rotate_audit(argv[1:])
+    if argv[:1] == ["demo"]:
+        return cmd_demo(argv[1:])
     args = build_parser().parse_args(argv)
     if args.init_policy:
         return cmd_init_policy(args)

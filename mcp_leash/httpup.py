@@ -30,6 +30,8 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import socket
+import ssl
 import subprocess
 import threading
 import urllib.error
@@ -169,6 +171,22 @@ def sse_events(resp):
                 raise ValueError("an event is over the size limit")
         elif field == b"event" and value not in (b"", b"message"):
             skip = True
+
+
+def _why(err) -> str:
+    """A reason a person can act on. Only the kind of failure, never the text
+    of the exception (it can carry the URL, and with it a token)."""
+    if isinstance(err, socket.gaierror):
+        return "the host name could not be found (check the URL and your network)"
+    if isinstance(err, ConnectionRefusedError):
+        return "connection refused (nothing is listening there)"
+    if isinstance(err, (TimeoutError, socket.timeout)):
+        return "timed out"
+    if isinstance(err, ssl.SSLError):
+        return "the TLS handshake or certificate check failed"
+    if isinstance(err, ConnectionError):
+        return "the connection was lost"
+    return type(err).__name__
 
 
 class HttpUpstream:
@@ -320,8 +338,7 @@ class HttpUpstream:
                 why = getattr(e, "reason", e)
                 for i in ids:
                     if _key(i) not in answered:
-                        self._error(i, f"upstream unreachable: "
-                                       f"{type(why).__name__}")
+                        self._error(i, f"upstream unreachable: {_why(why)}")
             else:
                 for i in ids:
                     if _key(i) not in answered:

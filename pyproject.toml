@@ -10,8 +10,12 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
+authors = [{name = "Dan Calas"}]
 keywords = ["mcp", "model-context-protocol", "security", "firewall", "proxy", "policy"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
     "Environment :: Console",
@@ -23,8 +27,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/calasdan-sketch/mcp-jail"
-Issues = "https://github.com/calasdan-sketch/mcp-jail/issues"
+Homepage = "https://github.com/calasdan-sketch/mcp-leash"
+Source = "https://github.com/calasdan-sketch/mcp-leash"
+Issues = "https://github.com/calasdan-sketch/mcp-leash/issues"
+Changelog = "https://github.com/calasdan-sketch/mcp-leash/blob/main/CHANGELOG.md"
 
 [project.scripts]
 mcp-leash = "mcp_leash.cli:main"

@@ -270,9 +270,25 @@ def _view(text: str) -> str:
 
 
 _B64_RUN = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{24,}={0,2}(?![A-Za-z0-9+/_=-])")
-_HEX_RUN = re.compile(r"(?<![0-9A-Za-z])(?:[0-9A-Fa-f]{2}){12,}(?![0-9A-Za-z])")
+# One character class repeated, not a repeated group: Python keeps a
+# backtracking mark for every pass of a group, about 70 bytes per character
+# (a 16 MB run of hex digits took 1.1 GB). An odd-length run is skipped in
+# _decoded, as a run of byte pairs would not have matched it.
+_HEX_RUN = re.compile(r"(?<![0-9A-Za-z])[0-9A-Fa-f]{24,}(?![0-9A-Za-z])")
 _PCT_RUN = re.compile(r"(?:[A-Za-z0-9._~+_-]|%[0-9A-Fa-f]{2}){6,}")
+_PCT_TOKEN = re.compile(r"[A-Za-z0-9._~+%-]+")
+MAX_PCT_TOKEN = 200_000         # longer stretches are not percent-decoded
 MAX_DECODE = 1_000_000          # characters of one encoded run worth decoding
+
+
+def _mostly_text(d: str) -> bool:
+    """True when at least 95% of `d` is printable (or newline, CR, tab):
+    what a decoded run must look like to be worth scanning. The common case,
+    all printable, is answered in C without walking the string."""
+    if d.isprintable():
+        return True
+    return sum(ch.isprintable() or ch in "\n\r\t" for ch in d) >= 0.95 * len(d)
+          # characters of one encoded run worth decoding
 
 
 def _decoded(view: str):
@@ -284,12 +300,16 @@ def _decoded(view: str):
     from urllib.parse import unquote
     out = []
     if "%" in view:
-        for m in _PCT_RUN.finditer(view):
-            t = m.group(0)
-            if "%" in t:
-                d = unquote(t, errors="replace") if t.isascii() else t
-                if d != t:
-                    out.append((m.start(), m.end(), "percent", d))
+        for tok in _PCT_TOKEN.finditer(view):
+            if "%" not in tok.group(0) or len(tok.group(0)) > MAX_PCT_TOKEN:
+                continue
+            for m in _PCT_RUN.finditer(tok.group(0)):
+                t = m.group(0)
+                if "%" in t:
+                    d = unquote(t, errors="replace") if t.isascii() else t
+                    if d != t:
+                        out.append((tok.start() + m.start(),
+                                    tok.start() + m.end(), "percent", d))
     for m in _B64_RUN.finditer(view):
         t = m.group(0)
         if len(t) > MAX_DECODE:
@@ -301,17 +321,17 @@ def _decoded(view: str):
             d = raw.decode("utf-8")
         except (binascii.Error, ValueError):
             continue
-        if len(d) >= 8 and sum(ch.isprintable() or ch in "\n\r\t" for ch in d) >= 0.95 * len(d):
+        if len(d) >= 8 and _mostly_text(d):
             out.append((m.start(), m.end(), "base64", d))
     for m in _HEX_RUN.finditer(view):
         t = m.group(0)
-        if len(t) > MAX_DECODE:
+        if len(t) > MAX_DECODE or len(t) % 2:
             continue
         try:
             d = bytes.fromhex(t).decode("utf-8")
         except ValueError:
             continue
-        if len(d) >= 8 and sum(ch.isprintable() or ch in "\n\r\t" for ch in d) >= 0.95 * len(d):
+        if len(d) >= 8 and _mostly_text(d):
             out.append((m.start(), m.end(), "hex", d))
     return out
 
