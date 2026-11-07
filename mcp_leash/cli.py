@@ -5,7 +5,7 @@ finds the problems; mcp-leash enforces least-privilege at runtime.
 
   mcp-leash --policy policy.json -- npx -y some-mcp-server
   mcp-leash --init-policy                # write an annotated starter policy
-  mcp-leash --audit                      # show the audit log
+  mcp-leash --audit [--decision deny] [--tool GLOB] [--since 24h] [--json]
   mcp-leash learn --script calls.json --out policy.json -- <server cmd>
   mcp-leash pin --policy policy.json -- <server cmd>   # pin tool definitions
   mcp-leash check --policy policy.json [TOOL [ARGS]]   # dry-run a decision
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import fnmatch
 import json
 import os
 import sys
@@ -154,21 +155,72 @@ def _plain(value) -> str:
                    for ch in value)
 
 
+def _since(text: str) -> float:
+    """--since: '30m', '24h', '7d' (ago) or an ISO date/time (UTC unless it
+    names an offset). Returns an epoch second."""
+    import datetime
+    import time
+    t = text.strip()
+    if len(t) >= 2 and t[:-1].isdigit() and t[-1] in "mhd":
+        return time.time() - int(t[:-1]) * {"m": 60, "h": 3600, "d": 86400}[t[-1]]
+    try:
+        dt = datetime.datetime.fromisoformat(t.replace("Z", "+00:00"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r}: use 30m, 24h, 7d or a date like 2026-11-01 or "
+            f"2026-11-01T09:30") from None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
+_DECISIONS = ("allow", "deny", "would_deny", "redact", "would_redact", "flag")
+
+
+def _wanted(e: dict, args) -> bool:
+    decision = e.get("decision")
+    decision = decision if isinstance(decision, str) else "allow"
+    if getattr(args, "decision", None) and decision not in args.decision:
+        return False
+    tool = getattr(args, "tool", None)
+    if tool is not None:
+        names = (e.get("tool"), e.get("method"))
+        if not any(isinstance(n, str) and fnmatch.fnmatchcase(
+                n.casefold(), tool.casefold()) for n in names):
+            return False
+    since = getattr(args, "since", None)
+    if since is not None:
+        at = e.get("at")
+        if not isinstance(at, (int, float)) or at < since:
+            return False
+    return True
+
+
 def cmd_audit(args) -> int:
     path = jail_mod.audit_log_path()
     if not os.path.exists(path):
         print("no audit log yet.")
         return 0
     denies = 0
+    shown = []
     with open(path, encoding="utf-8", errors="replace") as f:
-        lines = f.readlines()[-args.limit:]
-    for ln in lines:
-        try:
-            e = json.loads(ln)
-        except (ValueError, RecursionError):
-            continue
-        if not isinstance(e, dict):
-            continue
+        for ln in f:
+            try:
+                e = json.loads(ln)
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(e, dict):
+                continue
+            if _wanted(e, args):
+                shown.append(e)
+                if len(shown) > args.limit:
+                    shown.pop(0)
+    if getattr(args, "json", False):
+        # one record per line, pure ASCII: safe to pipe into a log shipper
+        for e in shown:
+            print(json.dumps(e, ensure_ascii=True, separators=(",", ":")))
+        return 0
+    for e in shown:
         decision = e.get("decision")
         denied = decision == "deny"
         denies += denied
@@ -186,7 +238,7 @@ def cmd_audit(args) -> int:
             else:  # a whole method refused by deny_methods
                 what = f"method {_plain(e.get('method'))}"
         print(f"{mark} {_plain(what)} {_plain(e.get('reason', ''))}")
-    print(f"\n{denies} denied in last {len(lines)} calls")
+    print(f"\n{denies} denied in last {len(shown)} calls")
     return 0
 
 
@@ -527,6 +579,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=_positive_count, default=50, metavar="N",
                    help="how many audit entries --audit shows: the last N, "
                         "a whole number, 1 or more (default: 50)")
+    p.add_argument("--decision", action="append", choices=_DECISIONS,
+                   metavar="KIND",
+                   help="--audit: only records with this decision (allow, "
+                        "deny, would_deny, redact, would_redact, flag); "
+                        "repeat for several")
+    p.add_argument("--tool", metavar="GLOB",
+                   help="--audit: only records whose tool or method matches "
+                        "this pattern (* and ?, case ignored)")
+    p.add_argument("--since", type=_since, metavar="WHEN",
+                   help="--audit: only records from then on: 30m, 24h, 7d "
+                        "or a date like 2026-11-01")
+    p.add_argument("--json", action="store_true",
+                   help="--audit: print the records as JSON lines (ASCII "
+                        "only) instead of the one-line report")
     p.add_argument("--timeout", type=_seconds, default=30.0, metavar="SECS",
                    help="seconds to wait for each server response, and for "
                         "the server to take each message off its stdin "

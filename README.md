@@ -154,6 +154,8 @@ mcp-leash --policy policy.json -- npx -y some-mcp-server
 mcp-leash --policy policy.json --timeout 10 -- npx -y some-mcp-server
 mcp-leash --policy policy.json --grace 10 -- npx -y some-mcp-server
 mcp-leash --audit                             # who got denied lately
+mcp-leash --audit --decision deny --since 24h # only denials, last day
+mcp-leash --audit --tool 'read_*' --json      # matching records as JSON lines (ASCII), for a log shipper
 mcp-leash learn --script calls.json --out policy.json -- npx -y some-mcp-server
 mcp-leash pin --policy policy.json -- npx -y some-mcp-server   # pin tool definitions
 mcp-leash pin --policy policy.json --dry-run -- npx -y some-mcp-server
@@ -831,11 +833,15 @@ patterns and on `learn` above apply as well):
   implemented, so server messages that arrive outside a request's own reply
   are not delivered.
 - **Scanning is a net with holes.** It finds the formats it has rules for,
-  after removing invisible characters and folding full-width forms. It does
-  not decode base64/hex/URL encoding, join a value split over two arguments,
-  or see Cyrillic look-alike letters; injection detection is a short list of
-  phrases, not a model. It scans about 5-8 MB/s, on the proxy's one thread.
-  Dictionary keys are not scanned.
+  after removing invisible characters and folding full-width forms. With
+  `decode` it looks inside base64, hex and percent-encoded runs (one level);
+  it does not join a value split over two arguments, undo a reversal or
+  character spacing, decode `\\u0067`-style or HTML escapes, or see Cyrillic
+  look-alike letters; injection detection is a short list of phrases, not a
+  model. It scans about 3 MB/s on this 2-vCPU VM (`benchmarks/bench_scan.py`),
+  on the proxy's one thread. Requests the client sends that are not policed
+  (`policed_methods`) and the client's replies to the server's own requests are
+  not scanned.
 
 - **It is a policy filter, not a sandbox.** mcp-leash inspects JSON-RPC
   messages on the pipe. It does not confine the server *process*: the
@@ -887,25 +893,41 @@ Add a `scan` block to the policy. Each section maps a detector to an action:
   "arguments":    {"secrets": "deny", "pii": "flag", "hidden": "deny"},
   "results":      {"secrets": "redact", "pii": "redact", "injection": "deny",
                    "hidden": "redact"},
-  "descriptions": {"injection": "hide"}
+  "descriptions": {"injection": "hide"},
+  "server_messages": {"injection": "deny", "secrets": "redact"},
+  "decode": true
 }
 ```
 
-- Detectors: `secrets` (AWS, GitHub, Slack, Stripe, Google, Anthropic, OpenAI-style,
-  npm, PyPI, SendGrid keys; JWTs; PEM private keys; passwords in database URLs;
+- Detectors: `secrets` (AWS, GitHub, GitLab, Slack, Stripe, Google (API key and
+  OAuth), Anthropic, OpenAI-style, npm, PyPI, SendGrid, Hugging Face, Shopify and
+  DigitalOcean tokens, Azure storage `AccountKey=`; JWTs; PEM private keys; passwords in database and `user:password@` URLs;
   `Bearer` tokens and `key = value` lines above an entropy floor), `pii` (card
   numbers with Luhn and a known prefix, Canadian SIN, US SSN, IBAN with
   mod-97), `injection` (phrases such as "ignore previous instructions",
   `<IMPORTANT>`, "do not tell the user", "send ~/.ssh/id_rsa"), `hidden`
   (zero-width, bidi-override and Unicode tag characters).
 - `arguments` (what the agent sends): `deny` refuses the call, `flag` lets it
-  through and notes it. `results` (what the server answers, errors too): `redact`
+  through and notes it. The whole `params` is scanned, not only `arguments`
+  (`_meta` reaches the server too), dictionary keys are scanned (a secret can
+  be sent as a key name), and so are fields named `data` or `blob`. `results` (what the server answers, errors too): `redact`
   replaces each match with `[mcp-leash: redacted <rule>]`, `deny` swaps the
   answer for an error, `flag` notes it. `descriptions` (tool listings): `hide`
   removes the tool and denies its calls, `flag` notes it. With `descriptions`
   on, a call made while a `tools/list` is unanswered is denied.
+- `server_messages` (what the server starts by itself: `sampling/createMessage`,
+  `elicitation/create`, `notifications/message`...): same actions as `results`.
+  `deny` drops the message, and a request is answered with an error sent to the
+  server so it does not wait; `redact` and `flag` as above. These messages are
+  the way a server puts text in front of your model without answering a call.
+- `"decode": true` (top level of `scan`, off by default) also looks inside
+  base64 (standard or URL-safe), hex and percent-encoded runs, one level deep,
+  in every section. The finding is named `base64:github_token`, and `redact`
+  replaces the whole run. Off by default because it costs time and a run that
+  decodes to text is a judgement call; `check` warns when scanning is on
+  without it.
 - The audit record names the rule and where (`content.0.text`), never the
-  matched text. Audit logs themselves now have secrets and card numbers
+  matched text (a flagged dictionary key shows as `<flagged key>`). Audit logs themselves now have secrets and card numbers
   replaced before arguments are written (`"audit_redact": false` turns that off).
 - `limits`: `{"max_calls": 500, "calls_per_minute": 60, "max_result_bytes": 200000,
   "per_tool": {"run_cmd": {"max_calls": 5}}}`. Per session; a denied call

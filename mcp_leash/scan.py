@@ -32,6 +32,10 @@ SECTIONS = {
     "arguments": (ARGUMENT_KINDS, ARGUMENT_ACTIONS),
     "results": (RESULT_KINDS, RESULT_ACTIONS),
     "descriptions": (DESCRIPTION_KINDS, DESCRIPTION_ACTIONS),
+    # requests and notifications the SERVER starts (sampling/createMessage,
+    # elicitation/create, notifications/message ...): a server's way to put
+    # text in front of the client's model without answering any call
+    "server_messages": (RESULT_KINDS, RESULT_ACTIONS),
 }
 MAX_FINDINGS = 20           # reported per message; the rest are counted, not listed
 
@@ -137,13 +141,27 @@ _RULES = [
     _r("secrets", "npm_token", r"\bnpm_[A-Za-z0-9]{36}\b", needles=("npm_",)),
     _r("secrets", "pypi_token", r"\bpypi-[A-Za-z0-9_-]{50,300}", needles=("pypi-",)),
     _r("secrets", "sendgrid_key", r"\bSG\.[A-Za-z0-9_-]{16,32}\.[A-Za-z0-9_-]{16,64}\b", needles=("SG.",)),
+    # Formats from public secret-scanner rule lists (for example gitleaks);
+    # not checked against each vendor's own documentation.
+    _r("secrets", "huggingface_token", r"\bhf_[A-Za-z0-9]{34,200}\b", needles=("hf_",)),
+    _r("secrets", "gitlab_token", r"\bglpat-[A-Za-z0-9_-]{20,100}", needles=("glpat-",)),
+    _r("secrets", "google_oauth_token", r"\bya29\.[A-Za-z0-9_-]{30,2000}", needles=("ya29.",)),
+    _r("secrets", "shopify_token", r"\bshp(?:at|ca|pa|ss)_[a-f0-9]{32}\b", needles=("shp",)),
+    _r("secrets", "digitalocean_token", r"\bdo[por]_v1_[a-f0-9]{64}\b", needles=("_v1_",)),
+    _r("secrets", "azure_storage_key", r"\bAccountKey=(?P<v>[A-Za-z0-9+/]{60,200}={0,2})", None, _I,
+       needles=("accountkey=",)),
     _r("secrets", "jwt",
        r"\beyJ[A-Za-z0-9_-]{8,2000}\.eyJ[A-Za-z0-9_-]{8,4000}\.[A-Za-z0-9_-]{8,2000}", needles=("eyJ",)),
+    # Tempered body, so a text made of nothing but headers costs time in
+    # proportion to its size (the earlier lazy form re-read 16 KB for every
+    # header: 100,000 headers took two minutes). A header with no matching END
+    # within 16 KB takes what follows it up to that limit: it fails closed.
     _r("secrets", "private_key",
        r"-----BEGIN [A-Z0-9 ]{0,30}PRIVATE KEY(?: BLOCK)?-----"
-       r"[\s\S]{0,16384}?(?:-----END [A-Z0-9 ]{0,30}PRIVATE KEY(?: BLOCK)?-----|\Z)", needles=("PRIVATE KEY",)),
+       r"(?:(?!-----(?:BEGIN|END) )[\s\S]){0,16384}"
+       r"(?:-----END [A-Z0-9 ]{0,30}PRIVATE KEY(?: BLOCK)?-----)?", needles=("PRIVATE KEY",)),
     _r("secrets", "db_url_password",
-       r"\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|amqps?)://"
+       r"\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|amqps?|https?|ftps?|sftp|ssh|smtps?|imaps?)://"
        r"[^\s:/@]{1,100}:(?P<v>[^\s@/]{3,200})@", needles=("://",)),
     _r("secrets", "bearer_token", r"\bBearer\s+(?P<v>[A-Za-z0-9._~+/=-]{24,500})",
        lambda t: _high_entropy(t), _I, needles=("bearer",)),
@@ -154,7 +172,7 @@ _RULES = [
        _high_entropy, _I,
        needles=("key", "secret", "token", "passw", "pwd")),
     # --- personal data ---------------------------------------------------
-    _r("pii", "card_number", r"(?<![\d.-])(?:\d[ -]?){12,18}\d(?![\d-])", _card_ok),
+    _r("pii", "card_number", r"(?<![\d.-])(?:\d[ .-]?){12,18}\d(?![\d-])", _card_ok),
     _r("pii", "canadian_sin", r"(?<![\d-])\d{3}[ -]\d{3}[ -]\d{3}(?![\d-])", _sin_ok),
     _r("pii", "us_ssn", r"(?<![\d-])(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}(?![\d-])"),
     _r("pii", "iban", r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,4})?\b",
@@ -221,6 +239,10 @@ def _spans(text: str, kinds):
                 if e > s:
                     out.append((s, e, kind, name))
     out.sort()
+    return _merge(out)
+
+
+def _merge(out):
     merged = []
     for item in out:
         if merged and item[0] < merged[-1][1]:
@@ -247,30 +269,95 @@ def _view(text: str) -> str:
     return _INVISIBLE.sub("", unicodedata.normalize("NFKC", text))
 
 
-def _passes(text: str, kinds):
+_B64_RUN = re.compile(r"(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{24,}={0,2}(?![A-Za-z0-9+/_=-])")
+_HEX_RUN = re.compile(r"(?<![0-9A-Za-z])(?:[0-9A-Fa-f]{2}){12,}(?![0-9A-Za-z])")
+_PCT_RUN = re.compile(r"(?:[A-Za-z0-9._~+-]|%[0-9A-Fa-f]{2}){6,}")
+MAX_DECODE = 1_000_000          # characters of one encoded run worth decoding
+
+
+def _decoded(view: str):
+    """(start, end, label, decoded text) for each base64, hex or
+    percent-encoded run in `view` that decodes to UTF-8 text. One level only:
+    what is inside a decoded run is not decoded again."""
+    import base64
+    import binascii
+    from urllib.parse import unquote
+    out = []
+    if "%" in view:
+        for m in _PCT_RUN.finditer(view):
+            t = m.group(0)
+            if "%" in t:
+                d = unquote(t, errors="replace") if t.isascii() else t
+                if d != t:
+                    out.append((m.start(), m.end(), "percent", d))
+    for m in _B64_RUN.finditer(view):
+        t = m.group(0)
+        if len(t) > MAX_DECODE:
+            continue
+        core = t.rstrip("=")
+        try:
+            raw = base64.b64decode(core.replace("-", "+").replace("_", "/")
+                                   + "=" * (-len(core) % 4), validate=True)
+            d = raw.decode("utf-8")
+        except (binascii.Error, ValueError):
+            continue
+        if len(d) >= 8 and sum(ch.isprintable() or ch in "\n\r\t" for ch in d) >= 0.95 * len(d):
+            out.append((m.start(), m.end(), "base64", d))
+    for m in _HEX_RUN.finditer(view):
+        t = m.group(0)
+        if len(t) > MAX_DECODE:
+            continue
+        try:
+            d = bytes.fromhex(t).decode("utf-8")
+        except ValueError:
+            continue
+        if len(d) >= 8 and sum(ch.isprintable() or ch in "\n\r\t" for ch in d) >= 0.95 * len(d):
+            out.append((m.start(), m.end(), "hex", d))
+    return out
+
+
+def _encoded_spans(view: str, kinds, decode: bool):
+    """Spans of encoded runs that hide a believable match. The rule is named
+    `base64:github_token` and so on; the whole run is the span."""
+    if not decode or not kinds:
+        return []
+    out = []
+    for s, e, label, d in _decoded(view):
+        inner = _spans(_view(d), kinds)
+        if inner:
+            out.append((s, e, inner[0][2], f"{label}:{inner[0][3]}"))
+    return out
+
+
+def _passes(text: str, kinds, decode: bool = False):
     """(hidden spans on the text itself, other spans on its view, the view)."""
     hidden = _spans(text, ("hidden",)) if "hidden" in kinds else []
     rest = tuple(k for k in kinds if k != "hidden")
     view = _view(text) if rest else text
-    return hidden, (_spans(view, rest) if rest else []), view
+    spans = _spans(view, rest) if rest else []
+    if decode and rest:
+        enc = _encoded_spans(view, rest, True)
+        if enc:
+            spans = _merge(sorted(spans + enc))
+    return hidden, spans, view
 
 
-def find(text: str, kinds) -> list[tuple[str, str]]:
+def find(text: str, kinds, decode: bool = False) -> list[tuple[str, str]]:
     """[(kind, rule)] of what `text` contains. No text is returned."""
     if not isinstance(text, str) or len(text) < 8:
         return []
-    hidden, rest, _view_text = _passes(text, kinds)
+    hidden, rest, _view_text = _passes(text, kinds, decode)
     return [(k, r) for _s, _e, k, r in hidden + rest]
 
 
-def redact_text(text: str, kinds) -> "tuple[str, list[tuple[str, str]]]":
+def redact_text(text: str, kinds, decode: bool = False) -> "tuple[str, list[tuple[str, str]]]":
     """`text` with each match replaced by a marker that names the rule
     (hidden characters are removed outright), and what was found. A text
     that held a secret comes back in its view form (see _view): that is the
     form the match was made on."""
     if not isinstance(text, str) or len(text) < 8:
         return text, []
-    hidden, rest, view = _passes(text, kinds)
+    hidden, rest, view = _passes(text, kinds, decode)
     if not hidden and not rest:
         return text, []
     if hidden:
@@ -279,6 +366,9 @@ def redact_text(text: str, kinds) -> "tuple[str, list[tuple[str, str]]]":
             return text, [(k, r) for _s, _e, k, r in hidden]
         view = _view(text)
         rest = _spans(view, tuple(k for k in kinds if k != "hidden"))
+        if decode:
+            rest = _merge(sorted(rest + _encoded_spans(
+                view, tuple(k for k in kinds if k != "hidden"), True)))
     if not rest:
         return text, [(k, r) for _s, _e, k, r in hidden]
     parts, last = [], 0
@@ -333,36 +423,76 @@ class Report:
 
 
 def scan_value(value, kinds_for, report: Report, redact: bool = False,
-               path: str = "", depth: int = 0):
+               path: str = "", depth: int = 0, decode: bool = False,
+               skip_binary: bool = True):
     """Walk `value` (JSON). `kinds_for` is the tuple of detector kinds to run.
     Returns the value with matches redacted when `redact`, else `value`
-    unchanged. Findings go to `report`. Dictionary keys are not scanned."""
+    unchanged. Findings go to `report`. Dictionary keys are scanned too (a
+    secret can be sent as a key name). `decode` also looks inside base64, hex
+    and percent-encoded runs. `skip_binary`: skip the payload of `data`/`blob`
+    fields that are declared non-text (an image in an answer: large and not
+    worth the time); arguments are scanned in full, since `{"blob": ...}` is
+    a field an agent can fill with anything."""
     if depth > 200:
         report.add("secrets", "too_deep_to_scan", path or "$")
         return value
     if isinstance(value, str):
         if redact:
-            new, found = redact_text(value, kinds_for)
+            new, found = redact_text(value, kinds_for, decode)
         else:
-            new, found = value, find(value, kinds_for)
+            new, found = value, find(value, kinds_for, decode)
         for kind, rule in found:
             report.add(kind, rule, path or "$")
         return new
     if isinstance(value, list):
         out = [scan_value(v, kinds_for, report, redact,
-                          f"{path}.{i}" if path else str(i), depth + 1)
+                          f"{path}.{i}" if path else str(i), depth + 1,
+                          decode, skip_binary)
                for i, v in enumerate(value)]
         return out if redact else value
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
-            if isinstance(v, str) and _is_binary_field(k, value):
-                out[k] = v
+            where = f"{path}.{k}" if path else str(k)
+            nk = k
+            if isinstance(k, str) and len(k) >= 8:
+                knew, kfound = (redact_text(k, kinds_for, decode) if redact
+                                else (k, find(k, kinds_for, decode)))
+                if kfound:
+                    # the key IS the finding: never put it in a path
+                    where = f"{path}.<flagged key>" if path else "<flagged key>"
+                for kind, rule in kfound:
+                    report.add(kind, rule, f"{where} (key)")
+                if redact and knew != k:
+                    nk = knew
+                    n = 1
+                    while nk in value or nk in out:     # never merge two keys
+                        n += 1
+                        nk = f"{knew}#{n}"
+            if skip_binary and isinstance(v, str) and _is_binary_field(k, value):
+                out[nk] = v
                 continue
-            out[k] = scan_value(v, kinds_for, report, redact,
-                                f"{path}.{k}" if path else str(k), depth + 1)
+            out[nk] = scan_value(v, kinds_for, report, redact, where,
+                                 depth + 1, decode, skip_binary)
         return out if redact else value
     return value
+
+
+def scan_params(params, kinds_for, report: Report, decode: bool = False):
+    """A call's whole params, not only `arguments`: `_meta` and any other
+    member reach the server too, so a secret can ride there. Findings in
+    `arguments` keep their short path (`path`, not `arguments.path`)."""
+    if not isinstance(params, dict):
+        scan_value(params, kinds_for, report, decode=decode, skip_binary=False)
+        return
+    for k, v in params.items():
+        flagged = isinstance(k, str) and len(k) >= 8 and bool(find(k, kinds_for, decode))
+        where = "<flagged key>" if flagged else str(k)
+        scan_value(v, kinds_for, report, decode=decode, skip_binary=False,
+                   path="" if k == "arguments" else where)
+        if flagged:
+            for kind, rule in find(k, kinds_for, decode):
+                report.add(kind, rule, "<flagged key> (key)")
 
 
 # --------------------------------------------------------------------------
@@ -373,7 +503,9 @@ def scan_value(value, kinds_for, report: Report, redact: bool = False,
 def compile_scan(spec) -> dict:
     """Validate the policy's `scan` block and return it normalised:
     {section: {kind: action}}. Raises ValueError on anything it cannot read
-    unambiguously (an unknown section, detector or action)."""
+    unambiguously (an unknown section, detector or action). `decode: true`
+    (a flag, not a section) makes every scan also look inside base64, hex and
+    percent-encoded runs."""
     if spec is None:
         return {}
     if not isinstance(spec, dict):
@@ -382,6 +514,12 @@ def compile_scan(spec) -> dict:
     out: dict = {}
     for section, body in spec.items():
         if section in ("_comment",):
+            continue
+        if section == "decode":
+            if not isinstance(body, bool):
+                raise ValueError("scan.decode must be true or false")
+            if body:
+                out["decode"] = True
             continue
         if section not in SECTIONS:
             raise ValueError(f"scan: unknown section {section!r} (expected "

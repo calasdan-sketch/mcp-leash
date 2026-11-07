@@ -1103,13 +1103,19 @@ def audit_args_view(value, depth: int = 0, redact: bool = True):
         return "...(nested too deep)"
     if isinstance(value, str):
         if redact:
-            value, _found = scanmod.redact_text(value, _LOG_KINDS)
+            value, _found = scanmod.redact_text(value, _LOG_KINDS, True)
         if len(value) <= AUDIT_VALUE_MAX:
             return value
         return value[:AUDIT_VALUE_MAX] + f"...(+{len(value) - AUDIT_VALUE_MAX})"
     if isinstance(value, dict):
-        return {str(k)[:AUDIT_VALUE_MAX]: audit_args_view(v, depth + 1, redact)
-                for k, v in value.items()}
+        out = {}
+        for k, v in value.items():
+            # a key can carry a secret too (sent as a key name)
+            key = str(k)
+            if redact:
+                key, _found = scanmod.redact_text(key, _LOG_KINDS, True)
+            out[key[:AUDIT_VALUE_MAX]] = audit_args_view(v, depth + 1, redact)
+        return out
     if isinstance(value, list):
         return [audit_args_view(v, depth + 1, redact) for v in value]
     return value
@@ -1207,7 +1213,7 @@ def _clip(value, limit: int = AUDIT_VALUE_MAX, redact: bool = False) -> str:
         except (ValueError, RecursionError):
             text = f"<{type(value).__name__}>"
     if redact:
-        text, _found = scanmod.redact_text(text, _LOG_KINDS)
+        text, _found = scanmod.redact_text(text, _LOG_KINDS, True)
     if len(text) <= limit:
         return text
     return text[:limit] + f"...(+{len(text) - limit})"
@@ -2089,7 +2095,9 @@ class _Proxy:
             if ok and self.pol is not None and mkey == "tools/call":
                 ok, reason = self._pin_gate(name)
             if ok and self._scan.get("arguments"):
-                ok, reason, extra = self._scan_arguments(targs)
+                ok, reason, extra = self._scan_arguments(
+                    msg.get("params") if isinstance(msg.get("params"), dict)
+                    else targs)
             if ok and self.pol is not None:
                 why = self.limiter.admit(name)
                 if why is not None:
@@ -2160,7 +2168,8 @@ class _Proxy:
         pass over the strings."""
         rules = self._scan["arguments"]
         rep = scanmod.Report()
-        scanmod.scan_value(targs, tuple(rules), rep)
+        scanmod.scan_params(targs, tuple(rules), rep,
+                            decode=bool(self._scan.get("decode")))
         if not rep:
             return True, "", None
         extra = {"scan": rep.listing()}
@@ -2188,6 +2197,45 @@ class _Proxy:
                                     f"mcp-leash blocked the result: {why}"))
         return False
 
+    def _scan_server_message(self, msg: dict) -> bool:
+        """scan.server_messages on a request or notification the server
+        started. False: not passed on (a request is answered with an error,
+        to the server, so it does not wait)."""
+        rules = self._scan["server_messages"]
+        params = msg.get("params")
+        if params is None:
+            return True
+        method = msg.get("method")
+        dec = bool(self._scan.get("decode"))
+        rep = scanmod.Report()
+        scanmod.scan_value(params, tuple(rules), rep, decode=dec)
+        if not rep:
+            return True
+        event = {"method": method if isinstance(method, str) else "?",
+                 "scan": rep.listing(), "server_message": True}
+        why = (f"message from the server ({_printable(method, 60)}) contains "
+               f"{rep.summary()} (scan.server_messages)")
+        if any(rules[k] == "deny" for k in rep.kinds()):
+            audit(dict(event, decision="would_deny" if self.monitor else "deny",
+                       reason=why))
+            if self.monitor:
+                return True
+            if "id" in msg:
+                self._forward(_rpc_error(msg["id"], INVALID_REQUEST,
+                                         f"mcp-leash blocked the request: {why}"),
+                              msg["id"], False)
+            return False
+        redact = tuple(k for k in rep.kinds() if rules[k] == "redact")
+        if redact:
+            if not self.monitor:
+                msg["params"] = scanmod.scan_value(
+                    params, redact, scanmod.Report(), redact=True, decode=dec)
+            audit(dict(event, decision="would_redact" if self.monitor
+                       else "redact", reason=why))
+        else:
+            audit(dict(event, decision="flag", reason=why))
+        return True
+
     def _scan_result(self, msg: dict, entry: dict) -> bool:
         """limits.max_result_bytes and scan.results on the answer to a
         policed request. False: the answer was replaced by an error."""
@@ -2205,8 +2253,9 @@ class _Proxy:
         if not rules:
             return True
         field = "result" if "result" in msg else "error"
+        dec = bool(self._scan.get("decode"))
         rep = scanmod.Report()
-        scanmod.scan_value(msg[field], tuple(rules), rep)
+        scanmod.scan_value(msg[field], tuple(rules), rep, decode=dec)
         if not rep:
             return True
         found = rep.listing()
@@ -2221,7 +2270,8 @@ class _Proxy:
         if redact:
             if not self.monitor:
                 msg[field] = scanmod.scan_value(msg[field], redact,
-                                                scanmod.Report(), redact=True)
+                                                scanmod.Report(), redact=True,
+                                                decode=dec)
             event.update(decision="would_redact" if self.monitor else "redact",
                          reason=f"answer contained {rep.summary()}; "
                                 f"redacted (scan.results)"
@@ -2249,7 +2299,8 @@ class _Proxy:
                 continue
             rep = scanmod.Report()
             scanmod.scan_value({k: v for k, v in tool.items() if k != "name"},
-                               tuple(rules), rep)
+                               tuple(rules), rep,
+                               decode=bool(self._scan.get("decode")))
             norm = normalize_tool_name(name)
             if not rep:
                 if norm not in self.poisoned:
@@ -2344,7 +2395,12 @@ class _Proxy:
                                     "result or an error", msg.get("id", _NO_ID),
                                     msg)
                 return False
-            # Server-originated request or notification: pass through.
+            # Server-originated request or notification: passed on, after
+            # scan.server_messages (a server can put text in front of the
+            # client's model through sampling/createMessage, elicitation or a
+            # log notification without answering any call).
+            if self.pol is not None and self._scan.get("server_messages"):
+                return self._scan_server_message(msg)
             return True
         if "id" not in msg:
             self._log("ignoring server message with neither method nor id")
@@ -3489,6 +3545,15 @@ def policy_warnings(pol: dict) -> list[str]:
     if not pol.get("hide_denied", True):
         warn.append("hide_denied is false: the agent sees tools it cannot "
                     "call")
+    sc = pol.get("_scan") or {}
+    if sc and not sc.get("decode"):
+        warn.append("scan.decode is off: a secret sent as base64, hex or "
+                    "%-escapes is not recognised; \"decode\": true looks "
+                    "inside such runs")
+    if sc.get("results") and not sc.get("server_messages"):
+        warn.append("scan.results covers the answers to policed calls only; "
+                    "scan.server_messages covers requests and notifications "
+                    "the server starts (sampling, elicitation, log messages)")
     return warn
 
 
@@ -3513,7 +3578,9 @@ def decide_call(pol: dict, mkey: str, params) -> tuple:
     rules = (pol.get("_scan") or {}).get("arguments")
     if ok and rules:
         rep = scanmod.Report()
-        scanmod.scan_value(targs, tuple(rules), rep)
+        scanmod.scan_params(params if isinstance(params, dict) else targs,
+                            tuple(rules), rep,
+                            decode=bool((pol.get("_scan") or {}).get("decode")))
         if rep and any(rules[k] == "deny" for k in rep.kinds()):
             return name, False, f"arguments contain {rep.summary()} (scan.arguments)"
     return name, ok, reason
@@ -3525,8 +3592,9 @@ def judge_answer(pol: dict, text) -> tuple:
     rules = (pol.get("_scan") or {}).get("results")
     if not rules:
         return "clean", text
+    dec = bool((pol.get("_scan") or {}).get("decode"))
     rep = scanmod.Report()
-    scanmod.scan_value(text, tuple(rules), rep)
+    scanmod.scan_value(text, tuple(rules), rep, decode=dec)
     if not rep:
         return "clean", text
     if any(rules[k] == "deny" for k in rep.kinds()):
@@ -3534,7 +3602,7 @@ def judge_answer(pol: dict, text) -> tuple:
     redact = tuple(k for k in rep.kinds() if rules[k] == "redact")
     if redact:
         return "redact", scanmod.scan_value(text, redact, scanmod.Report(),
-                                            redact=True)
+                                            redact=True, decode=dec)
     return "flag", text
 
 

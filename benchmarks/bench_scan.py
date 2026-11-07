@@ -80,6 +80,10 @@ PLANTED = {
     "db_url_password": lambda r: "postgres://svc:" + rs(r, 16) + "@db.internal:5432/app",
     "assigned_secret": lambda r: r.choice(["API_KEY", "client_secret", "password"]) + "=" + rs(r, 28),
     "card_number": lambda r: luhn_complete(r, "4", 16),
+    "huggingface_token": lambda r: "hf" + "_" + rs(r, 36),
+    "gitlab_token": lambda r: "glp" + "at-" + rs(r, 20, B64),
+    "google_oauth_token": lambda r: "ya" + "29." + rs(r, 50, B64),
+    "https_url_password": lambda r: "https://svc:" + rs(r, 14) + "@host.example/p",
     "us_ssn": lambda r: "%03d-%02d-%04d" % (r.randint(100, 665), r.randint(1, 99), r.randint(1, 9999)),
 }
 
@@ -226,8 +230,12 @@ def blind_spots():
         "full-width letters": "".join(
             chr(0xFF01 + ord(c) - 33) if c.isalnum() else c for c in tok),
         "Cyrillic look-alike": tok.replace("p", "\u0440", 1),
+        "percent-escaped": "".join("%%%02x" % ord(c) for c in tok),
+        "base64 url-safe, with a prefix": base64.urlsafe_b64encode(("key=" + tok).encode()).decode(),
     }
-    return {k: bool(scan.find("x " + v, scan.KINDS[:2])) for k, v in forms.items()}
+    kinds = scan.KINDS[:2]
+    return {k: (bool(scan.find("x " + v, kinds)), bool(scan.find("x " + v, kinds, True)))
+            for k, v in forms.items()}
 
 
 def table(per, total_clean, fp, title):
@@ -257,8 +265,11 @@ def main():
     print(f"\n  speed, all four detector kinds: {dense:.1f} MB/s on {dsize:.1f} MB "
           f"dense with planted values; {plain:.1f} MB/s on {psize:.1f} MB of benign text")
     blind = blind_spots()
-    print(f"  evasions tried on one token: {sum(blind.values())}/{len(blind)} found: "
-          + ", ".join(f"{k} {'found' if v else 'MISSED'}" for k, v in blind.items()))
+    print(f"  evasions tried on one token ({len(blind)}): found by default "
+          f"{sum(a for a, _b in blind.values())}, with scan.decode "
+          f"{sum(b for _a, b in blind.values())}")
+    for k, (a, b) in blind.items():
+        print(f"    {k:32} default {'found ' if a else 'MISSED'}  decode {'found' if b else 'MISSED'}")
     with tempfile.TemporaryDirectory() as home:
         policy = os.path.join(home, "policy.json")
         with open(policy, "w", encoding="utf-8") as f:
