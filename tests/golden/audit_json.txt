@@ -1,0 +1,3 @@
+{"decision":"deny","reason":"tool 'delete_all' is denied by policy","tool":"delete_all","at":1794096420}
+{"decision":"deny","reason":"tool 'read_file': argument path matches no allow pattern","tool":"read_file","at":1794096421,"args":{"path":"/etc/passwd"}}
+{"decision":"deny","reason":"tool 'delete_all' is denied by policy","tool":"delete_all","at":1794096423}

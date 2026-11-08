@@ -1,0 +1,11 @@
+5 record(s)
+from 2026-11-08 00:06:59 UTC to 2026-11-08 00:07:03 UTC
+  deny         3
+  allow        1
+  flag         1
+most denied:
+       2  delete_all
+       1  read_file
+most common reasons:
+       2  tool 'delete_all' is denied by policy
+       1  tool 'read_file': argument path matches no allow pattern

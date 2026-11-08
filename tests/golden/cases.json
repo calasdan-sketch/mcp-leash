@@ -1,0 +1,7 @@
+[
+  {"name": "reads a data file", "tool": "read_file", "arguments": {"path": "/srv/data/a.txt"}, "expect": "allow"},
+  {"name": "passwd is refused", "tool": "read_file", "arguments": {"path": "/etc/passwd"}, "expect": "deny", "reason_contains": "no allow pattern"},
+  {"name": "delete_all is refused", "tool": "delete_all", "expect": "deny"},
+  {"name": "wrongly expected", "tool": "search", "arguments": {"q": "x"}, "expect": "deny"},
+  {"name": "odd ‮ name\u0007 <&>\"", "tool": "nope", "expect": "allow"}
+]

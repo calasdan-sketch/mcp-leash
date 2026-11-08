@@ -1,0 +1,22 @@
+mcp-leash demo: a made-up server, a small policy, no network.
+Policy: only read_file, only /demo/<name>; secrets in arguments refused;
+        read_file's definition is pinned.
+
+1. the server offers two tools; the client is shown: ['read_file']
+2. read_file /demo/notes.txt
+     allowed  {"content": [{"type": "text", "text": "demo server ran read_file"}]}
+3. read_file /etc/passwd
+     BLOCKED  mcp-leash denied: tool 'read_file': argument path matches no allow pattern
+4. delete_all
+     BLOCKED  mcp-leash denied: tool 'delete_all' is not in allow_tools
+5. read_file with a token in the path
+     BLOCKED  mcp-leash denied: arguments contain 1 x github_token (scan.arguments)
+
+6. the server is swapped for one that adds a hidden instruction to read_file's description (a 'rug pull'):
+     the client is now shown: []  (read_file is gone)
+     a call to it: BLOCKED  mcp-leash denied: tool 'read_file' definition changed since it was pinned (pinned sha256:10020b9ea9be..., now sha256:ad73fa713092...): review it, then re-pin with `mcp-leash pin`
+
+audit log: 6 records, hash chain intact (`mcp-leash verify-audit` checks yours)
+
+Next: `mcp-leash learn --script calls.json --out policy.json -- <your server>` writes a policy like this one for a real server (see the README).
+--stderr--

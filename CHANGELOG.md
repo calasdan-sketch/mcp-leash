@@ -2,6 +2,17 @@
 
 ## 0.9.0 (unreleased)
 
+Round 5 (specialists: MCP security researcher, policy-engine designer, firewall/proxy engineer, red-teamer, test-methodology reviewer, release engineer, Claude Code user; notes in `docs/ROUND5.md`):
+
+- **Author line**: the package author and maintainer, the licence holder and `mcp_leash.__author__` are now exactly "Calas Automations Inc." (a test pins it; the JUnit file names it as vendor).
+- **New `limits.max_message_bytes`** (4096 or more; off unless set; `learn` now writes 16 MiB): one JSON-RPC line longer than this, from the client or from the server, is read and thrown away, never held whole, parsed, scanned or forwarded. The client gets `-32600` "message too large" (under its own id when the line begins or ends with it, else null), a server line fails the request it answers, and both are `rejected` audit records. A 200 MB line: 973 MB of memory and 42 s before, 28 MB and 0.4 s with a 1 MiB ceiling. `check` warns while it is unset. Lines already queued are not bounded (see *Limitations*).
+- **Fixed: `..` traversal behind an allow rule.** A value such as `/data/%2e%2e/x`, `/data/..%2fx` (up to three layers of percent-encoding), full-width dots (`/data/．．/x`) or, for Windows, a path ending in `.. ` or `...` passed an allow pattern like `^/data/`; all are refused now unless the pattern spells out `\.\.`. (Behaviour change for a value that really contains `%2e%2e`: write the pattern to say so.)
+- **`mcp-leash wrap NAME -- <server command>`** prints the client-config entry (`{"mcpServers": ...}`, or `--format claude-code` for the `claude mcp add` line; `--url` for a remote server). It only prints.
+- **`mcp-leash schema`** prints a JSON Schema of the policy file for editor autocomplete; a test keeps it in step with the loader's key list and the scanner's detectors.
+- **`mcp-leash test --junit FILE`** also writes JUnit XML; **`mcp-leash check --json`** prints the decision (or the summary and warnings) as one line of ASCII JSON. Exit statuses unchanged.
+- Tests: seeded property tests of the policy engine, golden files for every output format (`tests/golden`), and `benchmarks/mutation_sanity.py`, which breaks 13 key conditions in a copy and checks the tests notice (all 13 caught). The sdist now carries `tests/`.
+- Upgrade from 0.7.0 (the registry's version) checked: the 0.7.0 policy, `~/.mcp-leash` folder and an unchained audit log all work unchanged under this tree; see `docs/ROUND5.md`.
+
 Round 4 (what a stranger gets from `pip install`; found by installing the built wheel into a clean environment and using it):
 
 - **`mcp-leash demo`**: a five-second tour that needs no MCP server of your own. It runs a made-up server behind a small policy and shows an allowed call, a refused path, an unlisted tool, a token caught in an argument, a rug pull, and the audit chain verifying. Everything happens in a throwaway folder. New subcommand name: a server command called `demo` given first now needs `--` before it.

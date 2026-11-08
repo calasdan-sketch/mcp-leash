@@ -1,0 +1,514 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mcp-leash policy",
+  "description": "Shape of an mcp-leash policy file. `mcp-leash check --policy FILE` is the full validation.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "allow_tools": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "tools that may be called; \"*\" is every tool"
+    },
+    "deny_tools": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "tools that may never be called (wins over allow_tools); \"*\" is every tool"
+    },
+    "arg_rules": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "allow": {
+            "anyOf": [
+              {
+                "const": "*"
+              },
+              {
+                "oneOf": [
+                  {
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "description": "a regular expression"
+                      },
+                      {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "minProperties": 1,
+                        "properties": {
+                          "type": {
+                            "enum": [
+                              "string",
+                              "number",
+                              "boolean",
+                              "null",
+                              "object",
+                              "array"
+                            ]
+                          },
+                          "pattern": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "oneOf": [
+                        {
+                          "type": "string",
+                          "description": "a regular expression"
+                        },
+                        {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "minProperties": 1,
+                          "properties": {
+                            "type": {
+                              "enum": [
+                                "string",
+                                "number",
+                                "boolean",
+                                "null",
+                                "object",
+                                "array"
+                              ]
+                            },
+                            "pattern": {
+                              "type": "string"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": {
+                      "oneOf": [
+                        {
+                          "oneOf": [
+                            {
+                              "type": "string",
+                              "description": "a regular expression"
+                            },
+                            {
+                              "type": "object",
+                              "additionalProperties": false,
+                              "minProperties": 1,
+                              "properties": {
+                                "type": {
+                                  "enum": [
+                                    "string",
+                                    "number",
+                                    "boolean",
+                                    "null",
+                                    "object",
+                                    "array"
+                                  ]
+                                },
+                                "pattern": {
+                                  "type": "string"
+                                }
+                              }
+                            }
+                          ]
+                        },
+                        {
+                          "type": "array",
+                          "items": {
+                            "oneOf": [
+                              {
+                                "type": "string",
+                                "description": "a regular expression"
+                              },
+                              {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "minProperties": 1,
+                                "properties": {
+                                  "type": {
+                                    "enum": [
+                                      "string",
+                                      "number",
+                                      "boolean",
+                                      "null",
+                                      "object",
+                                      "array"
+                                    ]
+                                  },
+                                  "pattern": {
+                                    "type": "string"
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "deny": {
+            "oneOf": [
+              {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "description": "a regular expression"
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "minProperties": 1,
+                    "properties": {
+                      "type": {
+                        "enum": [
+                          "string",
+                          "number",
+                          "boolean",
+                          "null",
+                          "object",
+                          "array"
+                        ]
+                      },
+                      "pattern": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "type": "array",
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "string",
+                      "description": "a regular expression"
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "minProperties": 1,
+                      "properties": {
+                        "type": {
+                          "enum": [
+                            "string",
+                            "number",
+                            "boolean",
+                            "null",
+                            "object",
+                            "array"
+                          ]
+                        },
+                        "pattern": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": {
+                  "oneOf": [
+                    {
+                      "oneOf": [
+                        {
+                          "type": "string",
+                          "description": "a regular expression"
+                        },
+                        {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "minProperties": 1,
+                          "properties": {
+                            "type": {
+                              "enum": [
+                                "string",
+                                "number",
+                                "boolean",
+                                "null",
+                                "object",
+                                "array"
+                              ]
+                            },
+                            "pattern": {
+                              "type": "string"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "oneOf": [
+                          {
+                            "type": "string",
+                            "description": "a regular expression"
+                          },
+                          {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "minProperties": 1,
+                            "properties": {
+                              "type": {
+                                "enum": [
+                                  "string",
+                                  "number",
+                                  "boolean",
+                                  "null",
+                                  "object",
+                                  "array"
+                                ]
+                              },
+                              "pattern": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "policed_methods": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "methods checked like tools/call"
+    },
+    "deny_methods": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "methods refused outright; \"resources/*\" style patterns are allowed here"
+    },
+    "strict_args": {
+      "type": "boolean"
+    },
+    "audit_args": {
+      "enum": [
+        "denied",
+        "all",
+        "none"
+      ]
+    },
+    "hide_denied": {
+      "type": "boolean"
+    },
+    "tool_pins": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^sha256:[0-9a-f]{64}$"
+      }
+    },
+    "require_pins": {
+      "type": "boolean"
+    },
+    "scan": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "_comment": {
+          "type": "string"
+        },
+        "decode": {
+          "type": "boolean"
+        },
+        "arguments": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "secrets": {
+              "enum": [
+                "deny",
+                "flag"
+              ]
+            },
+            "pii": {
+              "enum": [
+                "deny",
+                "flag"
+              ]
+            },
+            "hidden": {
+              "enum": [
+                "deny",
+                "flag"
+              ]
+            }
+          }
+        },
+        "results": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "secrets": {
+              "enum": [
+                "redact",
+                "deny",
+                "flag"
+              ]
+            },
+            "pii": {
+              "enum": [
+                "redact",
+                "deny",
+                "flag"
+              ]
+            },
+            "injection": {
+              "enum": [
+                "redact",
+                "deny",
+                "flag"
+              ]
+            },
+            "hidden": {
+              "enum": [
+                "redact",
+                "deny",
+                "flag"
+              ]
+            }
+          }
+        },
+        "descriptions": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "injection": {
+              "enum": [
+                "hide",
+                "flag"
+              ]
+            },
+            "hidden": {
+              "enum": [
+                "hide",
+                "flag"
+              ]
+            }
+          }
+        },
+        "server_messages": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "secrets": {
+              "enum": [
+                "redact",
+                "deny",
+                "flag"
+              ]
+            },
+            "pii": {
+              "enum": [
+                "redact",
+                "deny",
+                "flag"
+              ]
+            },
+            "injection": {
+              "enum": [
+                "redact",
+                "deny",
+                "flag"
+              ]
+            },
+            "hidden": {
+              "enum": [
+                "redact",
+                "deny",
+                "flag"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "calls_per_minute": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_calls": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_result_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_message_bytes": {
+          "type": "integer",
+          "minimum": 4096
+        },
+        "per_tool": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "calls_per_minute": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "max_calls": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        "_comment": {
+          "type": "string"
+        }
+      }
+    },
+    "audit_redact": {
+      "type": "boolean"
+    },
+    "audit_max_bytes": {
+      "type": "integer",
+      "minimum": 4096
+    },
+    "audit_required": {
+      "type": "boolean"
+    },
+    "_comment": {},
+    "_not_called": {}
+  }
+}

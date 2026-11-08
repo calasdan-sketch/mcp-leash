@@ -232,8 +232,14 @@ class TestPackagingMetadata(unittest.TestCase):
             self.assertIn("calasdan-sketch/mcp-leash", line)
 
     def test_author_and_changelog_are_named(self):
-        self.assertIn('authors = [{name = "Dan Calas"}]', self.pp)
+        self.assertIn('authors = [{name = "Calas Automations Inc."}]', self.pp)
+        self.assertIn('maintainers = [{name = "Calas Automations Inc."}]', self.pp)
+        self.assertNotIn("Dan Calas", self.pp)
         self.assertTrue((ROOT / "CHANGELOG.md").exists())
+
+    def test_dunder_author_is_pinned(self):
+        import mcp_leash
+        self.assertEqual(mcp_leash.__author__, "Calas Automations Inc.")
 
     def test_changelog_has_the_current_version(self):
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")

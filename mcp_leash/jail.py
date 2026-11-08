@@ -44,6 +44,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import urllib.parse
 
 from . import VERSION
 from . import httpup
@@ -202,7 +203,29 @@ AUDIT_VALUE_MAX = 200  # chars of any one string value kept in the audit log
 
 # A value containing a `..` path segment (`/../`, leading `../`,
 # trailing `/..`, or just `..`), with either separator.
-_TRAVERSAL = re.compile(r"(?:^|[/\\])\.\.(?:[/\\]|$)")
+# A `..` segment. At the very end, Windows also reads `.. ` and `...` (trailing
+# spaces and dots are trimmed from a path) as `..`.
+_TRAVERSAL = re.compile(r"(?:^|[/\\])\.\.(?:[/\\]|[. ]*$)")
+
+
+def _has_traversal(text: str) -> bool:
+    """Does the value hold a `..` path segment, written plainly, percent-
+    encoded (`%2e%2e`, `..%2f`, up to three layers, as a URL-taking server
+    would decode it) or in full-width forms (NFKC)?"""
+    if _TRAVERSAL.search(text):
+        return True
+    seen = text
+    for _ in range(3):
+        if "%" not in seen:
+            break
+        seen = urllib.parse.unquote(seen, errors="replace")
+        if _TRAVERSAL.search(seen):
+            return True
+    if not text.isascii():
+        folded = unicodedata.normalize("NFKC", text)
+        if folded != text and _has_traversal(folded):
+            return True
+    return False
 
 # Prepended by `learn` to every class-based pattern: a prefix like
 # /srv/data/ plus a class that admits `.` and `/` would otherwise match
@@ -625,7 +648,11 @@ def compile_policy(pol: dict) -> dict:
 # limits: how much a session may do
 # ---------------------------------------------------------------------------
 
-_LIMIT_KEYS = ("calls_per_minute", "max_calls", "max_result_bytes", "per_tool")
+_LIMIT_KEYS = ("calls_per_minute", "max_calls", "max_result_bytes",
+               "max_message_bytes", "per_tool")
+_LIMIT_NUMBERS = _LIMIT_KEYS[:4]
+MIN_MESSAGE_CAP = 4096
+LEARNED_MESSAGE_CAP = 16 * 1024 * 1024
 _TOOL_LIMIT_KEYS = ("calls_per_minute", "max_calls")
 
 
@@ -644,10 +671,14 @@ def _compile_limits(spec) -> dict:
     if not isinstance(spec, dict):
         raise ValueError("limits must be an object")
     _check_keys(spec, _LIMIT_KEYS + ("_comment",), "limits")
-    for key in _LIMIT_KEYS[:3]:
+    for key in _LIMIT_NUMBERS:
         _limit_number(spec, key, "limits")
+    cap = spec.get("max_message_bytes")
+    if cap is not None and cap < MIN_MESSAGE_CAP:
+        raise ValueError(f"limits.max_message_bytes must be {MIN_MESSAGE_CAP} "
+                         f"or more (a smaller ceiling refuses the handshake)")
     per_tool = spec.get("per_tool")
-    out = {k: spec[k] for k in _LIMIT_KEYS[:3] if k in spec}
+    out = {k: spec[k] for k in _LIMIT_NUMBERS if k in spec}
     out["per_tool"] = {}
     if per_tool is not None:
         if not isinstance(per_tool, dict):
@@ -988,10 +1019,10 @@ def _allow_admits(allow: list[Rule], path, text, vtype) -> tuple[bool, bool]:
             continue
         if not rule.pattern.search(text):
             continue
-        if _TRAVERSAL.search(text) and not rule.dotdot_ok:
+        if _has_traversal(text) and not rule.dotdot_ok:
             continue  # vetoed
         return True, False
-    return False, bool(path_hit and _TRAVERSAL.search(text))
+    return False, bool(path_hit and _has_traversal(text))
 
 
 def tool_allowed(pol: dict, name, args) -> tuple[bool, str]:
@@ -1301,13 +1332,19 @@ class _FdLineReader:
         self._buf = bytearray()
         self._eof = False
 
-    def readline(self) -> bytes:
+    def readline(self, limit: int = -1) -> bytes:
+        """One line; with a `limit`, at most that many bytes of it (like
+        io.BufferedReader.readline): the rest comes with the next call."""
         scanned = 0         # bytes of _buf already known to hold no newline
         while True:
             i = self._buf.find(b"\n", scanned)
-            if i >= 0:
+            if i >= 0 and (limit < 0 or i + 1 <= limit):
                 line = bytes(self._buf[:i + 1])
                 del self._buf[:i + 1]
+                return line
+            if limit >= 0 and len(self._buf) >= limit:
+                line = bytes(self._buf[:limit])
+                del self._buf[:limit]
                 return line
             scanned = len(self._buf)    # not re-searched: a long line stays linear
             if self._eof:
@@ -1504,18 +1541,74 @@ class _ServerInput:
             self._notify(failure)
 
 
+class _Oversize:
+    """A line longer than limits.max_message_bytes, as the reader hands it
+    over: only its first bytes are kept (the rest was read and thrown away,
+    up to the next newline), and `size` is how long it was."""
+
+    def __init__(self, head: bytes, size: int, tail: bytes = b""):
+        self.head, self.size, self.tail = head, size, tail
+
+
+_ID_HEAD = re.compile(
+    rb'\A\{\s*(?:"jsonrpc"\s*:\s*"2\.0"\s*,\s*)?"id"\s*:\s*'
+    rb'(-?[0-9]{1,15}|"[^"\\\x00-\x1f]{0,100}")\s*[,}]')
+
+
+_ID_TAIL = re.compile(
+    rb',\s*"id"\s*:\s*(-?[0-9]{1,15}|"[^"\\\x00-\x1f]{0,100}")\s*\}\s*\Z')
+
+
+def _head_id(head: bytes, tail: bytes = b""):
+    """The id of a message too long to hold, when it opens with `{"id":` or
+    `{"jsonrpc":"2.0","id":`, or ends with `,"id":N}` (a top-level member
+    either way: a nested object's id is followed by two closing braces, and
+    one inside a string has escaped quotes); _NO_ID otherwise."""
+    m = _ID_HEAD.match(head) or _ID_TAIL.search(tail)
+    if m is None:
+        return _NO_ID
+    try:
+        return json.loads(m.group(1))
+    except ValueError:
+        return _NO_ID
+
+
 class _Reader(threading.Thread):
     """Pump lines from a binary stream into a queue as (tag, line);
-    (tag, None) marks EOF or a broken pipe."""
+    (tag, None) marks EOF or a broken pipe. With `cap`, a line of more than
+    that many bytes is not held: the reader keeps its first bytes, discards
+    the rest up to the newline and queues an _Oversize in its place, so the
+    memory one line can take is bounded."""
 
-    def __init__(self, stream, tag: str, q: "queue.Queue"):
+    HEAD = 4096
+
+    def __init__(self, stream, tag: str, q: "queue.Queue",
+                 cap: "int | None" = None):
         super().__init__(name=f"mcp-leash-{tag}-reader", daemon=True)
-        self._stream, self._tag, self._q = stream, tag, q
+        self._stream, self._tag, self._q, self._cap = stream, tag, q, cap
+
+    def _read(self):
+        if not self._cap:
+            return self._stream.readline()
+        line = self._stream.readline(self._cap + 1)
+        if len(line) <= self._cap or line.endswith(b"\n"):
+            return line
+        head, size, tail = line[:self.HEAD], len(line), line[-256:]
+        while True:             # discard the rest of this line
+            more = self._stream.readline(1 << 20)
+            size += len(more)
+            tail = (tail + more)[-256:]
+            if not more or more.endswith(b"\n"):
+                break
+        return _Oversize(head, size, tail.rstrip(b"\r\n"))
 
     def run(self) -> None:
         try:
             while True:
-                line = self._stream.readline()
+                line = self._read()
+                if isinstance(line, _Oversize):
+                    self._q.put((self._tag, line))
+                    continue
                 if not line:
                     break
                 # Frames are newline-delimited; a Windows text-mode peer
@@ -2047,6 +2140,28 @@ class _Proxy:
             prefix = "Parse error" if code == PARSE_ERROR else "Invalid Request"
             self.client.send(_rpc_error(req_id, code, f"{prefix}: {why}"))
         self._audit_rejected("client", why, subject, method)
+
+    def _too_big(self, over: "_Oversize") -> str:
+        cap = ((self.pol or {}).get("_limits") or {}).get("max_message_bytes")
+        return (f"message too large ({over.size} bytes or more; "
+                f"limits.max_message_bytes is {cap})")
+
+    def _on_client_oversize(self, over: "_Oversize") -> None:
+        """A client line over the ceiling: refused whole (never relayed,
+        never scanned), answered under its id when its first bytes give one
+        and with a null id otherwise, and on the audit record."""
+        rid = _head_id(over.head, over.tail)
+        self._refuse(self._too_big(over), INVALID_REQUEST,
+                     req_id=None if rid is _NO_ID else rid,
+                     subject=over.head)
+
+    def _on_server_oversize(self, over: "_Oversize") -> None:
+        """A server line over the ceiling: dropped; the request it answers
+        fails closed by id when its first bytes give one, else it waits for
+        --timeout like any answer that never came."""
+        self._refuse_server(self._too_big(over),
+                            _head_id(over.head, over.tail),
+                            over.head)
 
     def _on_client_line(self, line: bytes) -> None:
         msg, code, err = _parse(line)
@@ -2715,8 +2830,9 @@ class _Proxy:
         closed its pipes while the client was still talking to it, stopped
         reading its input, or left a request unanswered past --timeout, and
         128 plus the number of the signal that stopped it."""
-        _Reader(self._client_in, "client", self.q).start()
-        _Reader(self.proc.stdout, "server", self.q).start()
+        cap = ((self.pol or {}).get("_limits") or {}).get("max_message_bytes")
+        _Reader(self._client_in, "client", self.q, cap).start()
+        _Reader(self.proc.stdout, "server", self.q, cap).start()
         self.server.start()
         client_open = True
         try:
@@ -2739,7 +2855,9 @@ class _Proxy:
                     if line is None:
                         client_open = False
                         continue
-                    self._handle(self._on_client_line, line)
+                    self._handle(self._on_client_oversize
+                                 if isinstance(line, _Oversize)
+                                 else self._on_client_line, line)
                 elif tag == "input":
                     if line is not None:    # writing failed: its stdin is gone
                         self._lose(f"closed its input ({line})", "server closed")
@@ -2757,7 +2875,9 @@ class _Proxy:
                         self._lose("exited or closed its output"
                                    + self._server_status(), "server closed")
                         break
-                    self._handle(self._on_server_line, line)
+                    self._handle(self._on_server_oversize
+                                 if isinstance(line, _Oversize)
+                                 else self._on_server_line, line)
         except (BrokenPipeError, KeyboardInterrupt):
             pass
         except (OSError, ValueError) as e:  # a pipe went away under us
@@ -3007,6 +3127,8 @@ def generate_policy(observed_tools: list[str],
         "strict_args": True,
         "audit_args": "denied",
         "hide_denied": True,
+        # one line of 16 MiB or more is refused, not held in memory
+        "limits": {"max_message_bytes": LEARNED_MESSAGE_CAP},
     })
     if pins:
         policy["tool_pins"] = pins
@@ -3589,6 +3711,10 @@ def policy_warnings(pol: dict) -> list[str]:
     if not pol.get("hide_denied", True):
         warn.append("hide_denied is false: the agent sees tools it cannot "
                     "call")
+    if not (pol.get("_limits") or {}).get("max_message_bytes"):
+        warn.append("no limits.max_message_bytes: one very long line from "
+                    "either side is read whole (memory use grows with it); "
+                    "a ceiling such as 16777216 refuses it instead")
     sc = pol.get("_scan") or {}
     if sc and not sc.get("decode"):
         warn.append("scan.decode is off: a secret sent as base64, hex or "
@@ -3655,7 +3781,39 @@ _CASE_KEYS = ("name", "method", "tool", "arguments", "params", "expect",
               "_comment")
 
 
-def run_cases(policy_path: str, cases_path: str) -> int:
+def junit_report(results: list, policy_path: str) -> str:
+    """The `test` results as JUnit XML (what CI systems read). `results` is
+    a list of (label, [problems]). Every text is made printable first, so
+    no control or bidi character reaches the XML; the tool is named in a
+    property."""
+    from xml.sax.saxutils import quoteattr
+    failed = sum(1 for _l, p in results if p)
+    out = ['<?xml version="1.0" encoding="UTF-8"?>',
+           f'<testsuites name="mcp-leash" tests="{len(results)}" '
+           f'failures="{failed}">',
+           f'<testsuite name="mcp-leash test" tests="{len(results)}" '
+           f'failures="{failed}" errors="0" skipped="0">',
+           '<properties>',
+           f'<property name="generator" value={quoteattr("mcp-leash " + VERSION)}/>',
+           '<property name="vendor" value="Calas Automations Inc."/>',
+           f'<property name="policy" value={quoteattr(_printable(policy_path, 300))}/>',
+           '</properties>']
+    for label, problems in results:
+        name = quoteattr(_printable(label, 200))
+        if problems:
+            msg = quoteattr(_printable("; ".join(problems), 600))
+            out.append(f'<testcase classname="mcp-leash" name={name}>'
+                       f'<failure message={msg} type="PolicyCase"/></testcase>')
+        else:
+            out.append(f'<testcase classname="mcp-leash" name={name}/>')
+    out += ['</testsuite>', '</testsuites>']
+    # XML 1.0 has no room for these even escaped; _printable already
+    # replaced them, this is the belt to those braces
+    return "\n".join(out) + "\n"
+
+
+def run_cases(policy_path: str, cases_path: str,
+              junit: "str | None" = None) -> int:
     """`mcp-leash test`: a file of expected decisions, run against a policy
     with the proxy's own code. Exit 0 all passed, 1 some failed, 2 unusable.
     A policy change that breaks a case is caught before it ships."""
@@ -3701,6 +3859,7 @@ def run_cases(policy_path: str, cases_path: str) -> int:
             _say(f"mcp-leash test: case {i} {problem}")
             return 2
     failed = 0
+    results = []
     for i, case in enumerate(cases, 1):
         label = _printable(case.get("name") or case.get("tool") or f"case {i}", 80)
         problems = []
@@ -3734,18 +3893,26 @@ def run_cases(policy_path: str, cases_path: str) -> int:
             if needle is not None and (not isinstance(after, str)
                                        or needle not in after):
                 problems.append(f"answer after scanning lacks {needle!r}")
+        results.append((label, problems))
         if problems:
             failed += 1
             print(f"FAIL {label}: " + "; ".join(problems))
         else:
             print(f"pass {label}")
     print(f"\n{len(cases) - failed} passed, {failed} failed")
+    if junit is not None:
+        try:
+            _write_atomic(expand_path(junit), junit_report(results, policy_path))
+        except OSError as e:
+            _say(f"mcp-leash test: cannot write {junit}: {e}")
+            return 2
     return 1 if failed else 0
 
 
 def check(policy_path: str, tool: "str | None" = None,
           args_text: "str | None" = None,
-          method: str = "tools/call", params_text: "str | None" = None) -> int:
+          method: str = "tools/call", params_text: "str | None" = None,
+          as_json: bool = False) -> int:
     """Without a tool: load the policy, print a summary and any warnings
     (exit 0, or 2 when it would be refused at start-up). With one: print the
     decision the jail would make for that call (exit 0 allow, 1 deny)."""
@@ -3768,6 +3935,10 @@ def check(policy_path: str, tool: "str | None" = None,
         allow = pol.get("allow_tools")
         allowed = ("every tool" if allow is None or "*" in allow
                    else f"{len(allow)} tool(s)")
+        if as_json:
+            print(json.dumps({"policy": "ok", "path": policy_path,
+                              "warnings": policy_warnings(pol)}))
+            return 0
         print(f"policy OK: {policy_path}")
         print(f"  allows {allowed}; denies {len(pol.get('deny_tools') or [])} "
               f"by name; argument rules for {len(pol['_rules_by_norm'])}; "
@@ -3800,10 +3971,21 @@ def check(policy_path: str, tool: "str | None" = None,
     if method_denied(pol, method):
         name, ok, reason = tool, False, f"method '{method}' is denied by policy"
     elif not method_policed(pol, method):
+        if as_json:
+            print(json.dumps({"decision": "allow", "method": method,
+                              "reason": "not a policed method, relayed "
+                                        "unchecked"}))
+            return 0
         print(f"ALLOW {method}: not a policed method, relayed unchecked")
         return 0
     else:
         name, ok, reason = decide_call(pol, mkey, params)
+    if as_json:
+        print(json.dumps({"decision": "allow" if ok else "deny",
+                          "method": method,
+                          "tool": name if isinstance(name, str) else tool,
+                          "reason": reason}))
+        return 0 if ok else 1
     shown = _printable(name if isinstance(name, str) else (tool or ""))
     if ok:
         print(f"ALLOW {method} {shown}")

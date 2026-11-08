@@ -1,0 +1,2 @@
+DENY  tools/call read_file: tool 'read_file': argument path matches no allow pattern
+--stderr--

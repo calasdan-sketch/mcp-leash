@@ -1,0 +1,11 @@
+{
+  "allow_tools": ["read_file", "search"],
+  "deny_tools": ["delete_all"],
+  "arg_rules": {
+    "read_file": {"allow": {"path": "^/srv/data/[a-z]+\\.txt$"}, "deny": {"**": "secret"}},
+    "search": {"allow": "*"}
+  },
+  "strict_args": true,
+  "scan": {"arguments": {"secrets": "deny"}, "results": {"secrets": "redact"}},
+  "limits": {"max_calls": 100}
+}

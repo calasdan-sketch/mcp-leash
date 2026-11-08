@@ -1,0 +1,7 @@
+allow read_file 
+DENY  delete_all tool 'delete_all' is denied by policy
+DENY  read_file tool 'read_file': argument path matches no allow pattern
+FLAG  search scan
+DENY  delete_all tool 'delete_all' is denied by policy
+
+3 denied in last 5 calls

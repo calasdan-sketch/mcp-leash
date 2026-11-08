@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="mcp-leash" tests="5" failures="2">
+<testsuite name="mcp-leash test" tests="5" failures="2" errors="0" skipped="0">
+<properties>
+<property name="generator" value="mcp-leash <VERSION>"/>
+<property name="vendor" value="Calas Automations Inc."/>
+<property name="policy" value="<TMP>/policy.json"/>
+</properties>
+<testcase classname="mcp-leash" name="reads a data file"/>
+<testcase classname="mcp-leash" name="passwd is refused"/>
+<testcase classname="mcp-leash" name="delete_all is refused"/>
+<testcase classname="mcp-leash" name="wrongly expected"><failure message="expected deny, got allow" type="PolicyCase"/></testcase>
+<testcase classname="mcp-leash" name='odd \u202e name\x07 &lt;&amp;&gt;"'><failure message="expected allow, got deny (tool 'nope' is not in allow_tools)" type="PolicyCase"/></testcase>
+</testsuite>
+</testsuites>

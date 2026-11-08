@@ -1,0 +1,8 @@
+pass reads a data file
+pass passwd is refused
+pass delete_all is refused
+FAIL wrongly expected: expected deny, got allow
+FAIL odd \u202e name\x07 <&>": expected allow, got deny (tool 'nope' is not in allow_tools)
+
+3 passed, 2 failed
+--stderr--

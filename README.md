@@ -32,6 +32,9 @@ mcp-leash check --policy ~/.mcp-leash/policy.json
 
 3. Put mcp-leash in front of the server in your MCP client's config (Claude
 Desktop, Cursor, ...). Zero client changes: only the command moves.
+`mcp-leash wrap NAME -- <your server command>` prints this entry for you
+(`--format claude-code` prints the `claude mcp add` line instead; it only
+prints, nothing is written).
 
 ```json
 "my-server": {
@@ -65,7 +68,10 @@ OK /home/me/.mcp-leash/audit.jsonl: 2 chained record(s) (sha256)
 
 Checked on 2026-11-05 against each project's own documentation (linked), and
 re-read on 2026-11-07 for mcpwall (npm still at 0.3.1) and VellaVeto (its
-[GitHub README][vella-readme], read in full; see below). A blank means the
+[GitHub README][vella-readme], read in full; see below). On 2026-11-08 only
+the registries could be asked: mcpwall is still 0.3.1 on npm (last modified
+2026-02-25); VellaVeto is on neither npm nor PyPI under that name, and its
+README was not re-read (unverified since the 11-07 reading). A blank means the
 page we read did not mention it, not that the product cannot do it.
 
 | | mcp-leash | [Docker MCP Gateway][docker] | [Lasso MCP Gateway][lasso] | [ToolHive][toolhive] | [VellaVeto][vella] | [mcpwall][mcpwall] |
@@ -178,11 +184,15 @@ mcp-leash pin --policy policy.json -- npx -y some-mcp-server   # pin tool defini
 mcp-leash pin --policy policy.json --dry-run -- npx -y some-mcp-server
 mcp-leash pin --policy policy.json --accept-changed -- npx -y some-mcp-server
 mcp-leash check --policy policy.json          # summary + warnings, no server
+mcp-leash check --policy policy.json --json run_cmd '{"cmd": "ls"}'   # the same decision as one line of JSON (for scripts, hooks)
 mcp-leash check --policy policy.json run_cmd '{"cmd": "ls"}'   # one decision
 mcp-leash check --policy policy.json --method prompts/get --params '{"name": "greet"}'
 mcp-leash --policy policy.json --url https://host/mcp --header-env Authorization=MY_AUTH   # a remote server
 mcp-leash --policy policy.json --monitor -- npx -y some-mcp-server    # judge and log, block nothing
 mcp-leash test --policy policy.json cases.json   # run expected decisions (for CI)
+mcp-leash test --policy policy.json cases.json --junit results.xml   # ... and write JUnit XML
+mcp-leash wrap files -- npx -y some-mcp-server   # print the client-config entry (json), or --format claude-code
+mcp-leash schema > policy.schema.json            # JSON Schema of the policy file (editor autocomplete)
 mcp-leash verify-audit                        # is the audit log intact?
 mcp-leash verify-audit --all                  # ... including rotated files
 mcp-leash rotate-audit                        # start a new log file, chain intact
@@ -192,7 +202,8 @@ mcp-leash --help                              # every flag, explained
 mcp-leash -- check                            # a server command named like a subcommand
 ```
 
-`learn`, `pin`, `check`, `test`, `rotate-audit`, `verify-audit` and `demo` are
+`learn`, `pin`, `check`, `test`, `rotate-audit`, `verify-audit`, `demo`, `wrap`
+and `schema` are
 subcommands when they come first. **Breaking change in 0.8.0:** a server command whose name is `pin`,
 `check` or `verify-audit`, given first (`mcp-leash check ...`), is now read as
 the subcommand. Put `--` before it (`mcp-leash --policy p.json -- check`),
@@ -890,13 +901,18 @@ patterns and on `learn` above apply as well):
   different file. Deny entries want that folding; allow entries would
   rather not have it. Prefer `deny_tools` / `deny_methods` for resources,
   or keep to lowercase URIs.
-- **Very large messages are slow, not refused.** There is no size ceiling on
-  one JSON-RPC line, and with scanning on, a single 16 MB argument took about
+- **Very large messages are slow, not refused, unless you set a ceiling.**
+  `limits.max_message_bytes` (above) refuses a longer line; without it there
+  is no ceiling on one JSON-RPC line, and with scanning on, a single 16 MB argument took about
   4 s to judge and a 50 MB one about 30 s (measured on a 2-vCPU VM, one thread,
   `scan` rules and `decode` on); peak memory was about 7 times the message (118 MB for 16 MB).
-  A client or server that sends an unbounded line without a newline can use
-  all the memory there is. Run mcp-leash under a memory limit
-  (`ulimit -v`, a container, a job object on Windows) if either side is not trusted.
+  Without the ceiling, a client or server that sends an unbounded line
+  without a newline can use all the memory there is. With it, one line is
+  bounded (the reader keeps at most the ceiling plus about 4 KB), but lines
+  already read and waiting in the queue are not: a peer that sends many
+  maximum-size lines faster than they are judged still grows memory. Run
+  mcp-leash under a memory limit (`ulimit -v`, a container, a job object on
+  Windows) if either side is not trusted.
 - **A stalled server is stopped by killing the process mcp-leash
   started.** A grandchild that still holds the server's stdin open
   (`npx` starting node) is not, and a write stuck on it can outlive the
@@ -968,8 +984,18 @@ Add a `scan` block to the policy. Each section maps a detector to an action:
   matched text (a flagged dictionary key shows as `<flagged key>`). Audit logs themselves now have secrets and card numbers
   replaced before arguments are written (`"audit_redact": false` turns that off).
 - `limits`: `{"max_calls": 500, "calls_per_minute": 60, "max_result_bytes": 200000,
-  "per_tool": {"run_cmd": {"max_calls": 5}}}`. Per session; a denied call
-  does not use the allowance; an answer over `max_result_bytes` becomes an error.
+  "max_message_bytes": 16777216, "per_tool": {"run_cmd": {"max_calls": 5}}}`.
+  Per session; a denied call does not use the allowance; an answer over
+  `max_result_bytes` becomes an error.
+  `max_message_bytes` (4096 or more; off unless set; `learn` writes 16 MiB) caps
+  **one JSON-RPC line from either side**: a longer line is read and thrown
+  away up to its newline, never held whole, never parsed or scanned, and
+  never forwarded. A client line gets error `-32600` ("message too large")
+  under its own id when the line starts or ends with its top-level `"id"`,
+  else under a `null` id, and the session goes on; a server line fails the
+  request it answers the same way (or, with no id to read, that request waits
+  for `--timeout`). Both are `rejected` records in the audit log. The count
+  includes a CR before the newline. `check` warns while it is unset.
 - `mcp-leash --monitor` judges and logs everything the same way but blocks,
   hides and redacts nothing; records read `would_deny` / `would_redact`. Run a
   new policy this way before enforcing it.
@@ -1006,7 +1032,14 @@ is watching. The jail is the enforcement half of the story.
 ```bash
 python3 -m unittest discover -s tests -t .   # fake stdio servers (+ the official MCP SDK when installed)
 python3 -m pytest -q                    # same suite
+python3 benchmarks/mutation_sanity.py   # breaks key conditions one at a time in a copy; the tests must notice (about 3 minutes)
 ```
+
+Besides example-based tests there are seeded property tests
+(`tests/test_round5_props.py`: a denied name is denied however it is written,
+key order never changes a decision, and so on) and stored copies of every
+output format in `tests/golden/` (`UPDATE_GOLDEN=1 python -m pytest
+tests/test_round5.py` rewrites them after a deliberate change; read the diff).
 
 Tests spawn fake MCP servers as subprocesses and point `HOME`,
 `USERPROFILE` and `APPDATA` at a throwaway directory, so they never

@@ -3,3 +3,4 @@ recursive-include benchmarks *.py
 recursive-include docs *.md
 include PUBLISH-CHECKLIST.md
 global-exclude __pycache__ *.py[cod]
+recursive-include tests *.py *.json *.jsonl *.txt *.xml

@@ -1,0 +1,4 @@
+allow read_file 
+DENY  read_file tool 'read_file': argument path matches no allow pattern
+
+1 denied in last 2 calls

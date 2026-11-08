@@ -13,6 +13,8 @@ finds the problems; mcp-leash enforces least-privilege at runtime.
   mcp-leash verify-audit                 # check the audit log's hash chain
   mcp-leash rotate-audit                 # start a new log file, chain intact
   mcp-leash demo                         # a 5-second tour, nothing to set up
+  mcp-leash wrap NAME -- <server cmd>    # print the client-config entry
+  mcp-leash schema                       # JSON Schema of the policy file
 """
 
 from __future__ import annotations
@@ -454,13 +456,19 @@ def cmd_check(argv: list[str]) -> int:
     p.add_argument("--params", metavar="JSON",
                    help="the call's whole params object, judged exactly as "
                         "the proxy judges it (instead of TOOL and ARGS)")
+    p.add_argument("--json", action="store_true",
+                   help="print the result as one line of ASCII JSON "
+                        "({\"decision\": \"allow\"|\"deny\", ...} for a "
+                        "call; {\"policy\": \"ok\", \"warnings\": [...]} "
+                        "without one); the exit status is unchanged")
     p.add_argument("tool", nargs="?", help="tool name (or URI)")
     p.add_argument("arguments", nargs="?",
                    help="the call's arguments as a JSON object "
                         "(default: {})")
     args = p.parse_args(argv)
     return jail_mod.check(args.policy, args.tool, args.arguments,
-                          method=args.method, params_text=args.params)
+                          method=args.method, params_text=args.params,
+                          as_json=args.json)
 
 
 def cmd_test(argv: list[str]) -> int:
@@ -479,8 +487,11 @@ def cmd_test(argv: list[str]) -> int:
     p.add_argument("--policy", default=default_policy, metavar="FILE",
                    help=f"policy file (default: {default_policy})")
     p.add_argument("cases", help="JSON array of cases")
+    p.add_argument("--junit", metavar="FILE",
+                   help="also write the results as JUnit XML (for CI "
+                        "dashboards); the exit status is unchanged")
     args = p.parse_args(argv)
-    return jail_mod.run_cases(args.policy, args.cases)
+    return jail_mod.run_cases(args.policy, args.cases, junit=args.junit)
 
 
 def cmd_verify_audit(argv: list[str]) -> int:
@@ -606,7 +617,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="mcp-leash", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="subcommands (each has --help): learn, pin, check, test, "
-               "verify-audit, rotate-audit, demo\n\n"
+               "verify-audit, rotate-audit, demo, wrap, schema\n\n"
                "exit status: 0 a clean session; 2 an unusable policy or "
                "command; 3 the server failed (it exited or closed its pipes, "
                "stopped reading its input, or did not answer a request "
@@ -672,6 +683,95 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def cmd_schema(argv: list[str]) -> int:
+    """mcp-leash schema: the JSON Schema of a policy file, on stdout."""
+    p = _Parser(prog="mcp-leash schema",
+                description="Print the JSON Schema of a policy file (for "
+                            "editor autocomplete: point your editor's "
+                            "JSON schema setting at the saved output). "
+                            "`check` is still the full validation.")
+    p.parse_args(argv)
+    from . import schema
+    print(json.dumps(schema.policy_schema(), indent=2, ensure_ascii=True))
+    return 0
+
+
+def _client_command(override: "str | None") -> list[str]:
+    """How a client should start mcp-leash: the command on PATH, as an
+    absolute path (desktop clients often do not see the shell's PATH), else
+    this Python running the module."""
+    if override:
+        return [override]
+    import shutil
+    found = shutil.which("mcp-leash")
+    return [os.path.abspath(found)] if found else [sys.executable, "-m", "mcp_leash"]
+
+
+def cmd_wrap(argv: list[str]) -> int:
+    default_policy = jail_mod.default_policy_path()
+    p = _Parser(
+        prog="mcp-leash wrap",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        usage="mcp-leash wrap [options] NAME -- SERVER_COMMAND...",
+        description="Print the entry that puts mcp-leash in front of an MCP "
+                    "server in a client's configuration (Claude Desktop, "
+                    "Cursor and others read {\"mcpServers\": ...}), or the "
+                    "`claude mcp add` command for Claude Code. It only "
+                    "prints: nothing is written or started. Give the same "
+                    "server command you use today, after --.")
+    p.add_argument("name", help="the name the client shows for this server")
+    p.add_argument("--policy", default=default_policy, metavar="FILE",
+                   help=f"policy file (default: {default_policy}); written "
+                        f"into the entry as an absolute path")
+    p.add_argument("--format", choices=("json", "claude-code"), default="json",
+                   help="json: a client config entry (default); claude-code: "
+                        "a `claude mcp add` command line")
+    p.add_argument("--command", metavar="PATH",
+                   help="how the client starts mcp-leash (default: the "
+                        "mcp-leash on your PATH, else this Python)")
+    _add_url_options(p)
+    # options and the name come first; everything after the first -- is the
+    # server command, kept as it is (REMAINDER would also swallow options
+    # written after the name)
+    cut = argv.index("--") if "--" in argv else len(argv)
+    args = p.parse_args(argv[:cut])
+    cmd = argv[cut + 1:]
+    if bool(cmd) == bool(args.url):
+        jail_mod._say("error: give a server command after -- , or --url "
+                      "URL (not both): mcp-leash wrap NAME -- npx -y some-server")
+        return 2
+    policy = os.path.abspath(jail_mod.expand_path(args.policy))
+    if not os.path.exists(policy):
+        jail_mod._say(f"note: no policy at {policy} yet: mcp-leash refuses "
+                      f"to start without one. `mcp-leash learn` writes one.")
+    parts = ["--policy", policy]
+    if args.url:
+        parts += ["--url", args.url]
+        for h in args.header:
+            jail_mod._say("warning: --header puts the value in the client's "
+                          "config file; for a credential use --header-env")
+            parts += ["--header", h]
+        for h in args.header_env:
+            parts += ["--header-env", h]
+        if args.allow_insecure_http:
+            parts += ["--allow-insecure-http"]
+    if cmd:
+        parts += ["--"] + cmd
+    launcher = _client_command(args.command)
+    if args.format == "claude-code":
+        argv_out = ["claude", "mcp", "add", args.name, "--"] + launcher + parts
+        if _WINDOWS:
+            import subprocess
+            print(subprocess.list2cmdline(argv_out))
+        else:
+            import shlex
+            print(shlex.join(argv_out))
+    else:
+        print(json.dumps({"mcpServers": {args.name: {
+            "command": launcher[0], "args": launcher[1:] + parts}}}, indent=2))
+    return 0
+
+
 def cmd_demo(argv: list[str]) -> int:
     """mcp-leash demo: a self-contained tour (see demo.py)."""
     if argv:
@@ -696,6 +796,10 @@ def _main(argv: list[str]) -> int:
         return cmd_rotate_audit(argv[1:])
     if argv[:1] == ["demo"]:
         return cmd_demo(argv[1:])
+    if argv[:1] == ["wrap"]:
+        return cmd_wrap(argv[1:])
+    if argv[:1] == ["schema"]:
+        return cmd_schema(argv[1:])
     args = build_parser().parse_args(argv)
     if args.init_policy:
         return cmd_init_policy(args)

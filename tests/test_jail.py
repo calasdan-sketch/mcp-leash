@@ -2159,7 +2159,8 @@ class TestDocs(unittest.TestCase):
         with open(os.path.join(REPO, "LICENSE"), encoding="utf-8") as f:
             lic = f.read()
         self.assertIn("MIT License", lic)
-        self.assertIn("Dan Calas", lic)
+        self.assertIn("Copyright (c) 2026 Calas Automations Inc.\n", lic)
+        self.assertNotIn("Dan Calas", lic)
         readme = self.readme()
         self.assertNotIn("TBD", readme)
         self.assertIn("pip install git+https://github.com/calasdan-sketch/mcp-leash", readme)

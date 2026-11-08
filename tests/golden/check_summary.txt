@@ -1,0 +1,8 @@
+policy OK: <TMP>/policy.json
+  allows 2 tool(s); denies 1 by name; argument rules for 2; 0 pinned; strict_args on
+  warning: arg_rules.search: allow "*" with no deny rules accepts any arguments
+  warning: no tool_pins: a server that changes a tool's description or schema (a rug pull) is not noticed; `mcp-leash pin` records them
+  warning: no limits.max_message_bytes: one very long line from either side is read whole (memory use grows with it); a ceiling such as 16777216 refuses it instead
+  warning: scan.decode is off: a secret sent as base64, hex or %-escapes is not recognised; "decode": true looks inside such runs
+  warning: scan.results covers the answers to policed calls only; scan.server_messages covers requests and notifications the server starts (sampling, elicitation, log messages)
+--stderr--
